@@ -16,6 +16,10 @@
 import logging
 import random
 import sys
+import os
+
+# Add the parent directory to Python path to find the alignment module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import transformers
