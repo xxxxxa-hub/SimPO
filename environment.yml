@@ -118,7 +118,7 @@ dependencies:
       - hjson==3.1.0
       - httpcore==1.0.5
       - httpx==0.27.0
-      - huggingface-hub==0.22.2
+      - huggingface-hub==0.24.7
       - idna==3.7
       - importlib-metadata==5.2.0
       - importlib-resources==6.4.0
@@ -230,7 +230,7 @@ dependencies:
       - thinc==8.2.3
       - threadpoolctl==3.4.0
       - tiktoken==0.6.0
-      - tokenizers==0.15.2
+      - tokenizers==0.19.1
       - tomli==2.0.1
       - toolz==0.12.1
       - torch==2.2.2
