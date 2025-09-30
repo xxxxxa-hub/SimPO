@@ -195,7 +195,78 @@ The output JSON file contains:
 ]
 ```
 
-## Stage 2: Preference Dataset Conversion
+## Stage 2: Bradley-Terry Model Scoring
+
+After obtaining pairwise win rates from Chain-of-Thought (CoT) preference comparisons, you can estimate response quality scores using the Bradley-Terry model.
+
+### Overview
+
+The Bradley-Terry model converts a preference matrix (pairwise win rates) into scalar strength scores for each response. This provides a principled ranking that:
+- Accounts for all pairwise comparisons simultaneously
+- Handles inconsistencies in preferences (e.g., A>B, B>C, C>A)
+- Provides interpretable strength scores
+
+### Usage
+
+```bash
+# Generate Bradley-Terry scores from preference matrices
+python bradley_terry_scoring.py gpt4_pairwise_preferences_test_0shot_cot_20trials.json
+
+# Or specify custom output file
+python bradley_terry_scoring.py \
+    gpt4_pairwise_preferences_test_0shot_cot_20trials.json \
+    --output custom_bt_scores.json
+```
+
+### Input Format
+
+The script expects JSON files with preference matrices:
+
+```json
+[
+  {
+    "sample_id": 30,
+    "prompt": "Question text...",
+    "responses": ["response1", "response2", "response3", "response4", "response5"],
+    "preference_matrix": [
+      [NaN, 0.0, 0.0, 0.525, 0.0],
+      [1.0, NaN, 1.0, 1.0, 1.0],
+      [1.0, 0.0, NaN, 1.0, 0.05],
+      [0.6, 0.05, 0.0, NaN, 0.0],
+      [1.0, 0.0, 1.0, 1.0, NaN]
+    ]
+  }
+]
+```
+
+### Output Format
+
+The script produces JSON with Bradley-Terry scores and rankings:
+
+```json
+[
+  {
+    "sample_id": 30,
+    "prompt": "Question text...",
+    "bt_scores": [2.1, 5.8, 3.4, 1.2, 2.5],
+    "rankings": [1, 2, 4, 0, 3],
+    "best_response_idx": 1,
+    "best_response": "response2",
+    "responses": ["response1", "response2", ...],
+    "preference_matrix": [[...]]
+  }
+]
+```
+
+### Using BT Scores for Few-Shot Examples
+
+The BT scores can be used to select high-quality few-shot examples. Use `load_few_shot_examples_from_bt_scores()` to automatically select:
+- **Chosen**: Response with highest BT score
+- **Rejected**: Response with lowest BT score
+
+This creates clearer preference distinctions in few-shot demonstrations.
+
+## Stage 3: Preference Dataset Conversion
 
 Convert pairwise preference comparison results into a preference dataset format compatible with [princeton-nlp/gemma2-ultrafeedback-armorm](https://huggingface.co/datasets/princeton-nlp/gemma2-ultrafeedback-armorm).
 
