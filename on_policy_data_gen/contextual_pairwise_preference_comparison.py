@@ -26,6 +26,8 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 import torch.distributed as dist
 from datetime import timedelta
+import datetime, torch.distributed as dist
+dist.init_process_group("nccl",timeout=datetime.timedelta(minutes=60))
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
