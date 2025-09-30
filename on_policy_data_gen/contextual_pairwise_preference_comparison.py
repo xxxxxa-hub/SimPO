@@ -192,14 +192,14 @@ def make_collate_fn(tokenizer, max_length=None):
 
 
 def load_few_shot_examples(dataset_name, indices, random_seed=42, permute_demonstrations=True):
-    """Load few-shot examples from test split based on specified indices."""
+    """Load few-shot examples from train split based on specified indices."""
     try:
         test_dataset = load_dataset(dataset_name, split='test')
 
         examples = []
         for idx in indices:
             if idx >= len(test_dataset):
-                logger.warning(f"Index {idx} is out of range for test dataset (size: {len(test_dataset)})")
+                logger.warning(f"Index {idx} is out of range for train dataset (size: {len(test_dataset)})")
                 continue
 
             sample = test_dataset[idx]
@@ -240,6 +240,80 @@ def load_few_shot_examples(dataset_name, indices, random_seed=42, permute_demons
         logger.warning(f"Failed to load few-shot examples: {e}")
         return []
 
+
+def load_few_shot_examples_from_bt_scores(bt_scores_file, indices, random_seed=42, permute_demonstrations=True):
+    """Load few-shot examples from Bradley-Terry scores file.
+
+    Selects the response with highest BT score as chosen and lowest BT score as rejected.
+
+    Args:
+        bt_scores_file: Path to JSON file with Bradley-Terry scores
+        indices: List of sample IDs to use for few-shot examples
+        random_seed: Random seed for shuffling
+        permute_demonstrations: Whether to create permuted demonstrations
+    """
+    try:
+        logger.info(f"Loading few-shot examples from Bradley-Terry scores file: {bt_scores_file}")
+        with open(bt_scores_file, 'r') as f:
+            bt_data = json.load(f)
+
+        examples = []
+        for idx in indices:
+            # Find the sample with matching sample_id
+            sample = None
+            for item in bt_data:
+                if item.get('sample_id') == idx:
+                    sample = item
+                    break
+
+            if sample is None:
+                logger.warning(f"Sample ID {idx} not found in Bradley-Terry scores file")
+                continue
+
+            question = sample.get('prompt', '')
+            responses = sample.get('responses', [])
+            bt_scores = sample.get('bt_scores', [])
+            rankings = sample.get('rankings', [])
+
+            if len(responses) == 0 or len(bt_scores) == 0:
+                logger.warning(f"Sample ID {idx} has no responses or scores")
+                continue
+
+            # Get best (highest BT score) and worst (lowest BT score) responses
+            best_idx = rankings[0]  # First in rankings = highest score
+            worst_idx = rankings[-1]  # Last in rankings = lowest score
+
+            chosen = responses[best_idx]
+            rejected = responses[worst_idx]
+
+            # Create first example: A=chosen, B=rejected (label=A)
+            examples.append({
+                'question': question,
+                'response_a': chosen,
+                'response_b': rejected,
+                'label': 'A'
+            })
+
+            # Create second example only if permute_demonstrations is True
+            if permute_demonstrations:
+                examples.append({
+                    'question': question,
+                    'response_a': rejected,
+                    'response_b': chosen,
+                    'label': 'B'
+                })
+
+        # Shuffle the examples to avoid order bias
+        random.seed(random_seed)
+        random.shuffle(examples)
+
+        logger.info(f"Loaded {len(examples)} few-shot examples from Bradley-Terry scores")
+        return examples
+
+    except Exception as e:
+        logger.warning(f"Failed to load few-shot examples from BT scores: {e}")
+        return []
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate pairwise preference comparisons with Accelerate")
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", 
@@ -259,7 +333,7 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=None,
                        help="Maximum sequence length for tokenization (None for no truncation)")
     parser.add_argument("--few_shot_indices", type=str, default="30,3,37,18",
-                       help="Comma-separated indices of test examples to use for few-shot (e.g., '30,3,37,18')")
+                       help="Comma-separated indices of train examples to use for few-shot (e.g., '30,3,37,18')")
     parser.add_argument("--few_shot_random_seed", type=int, default=42,
                        help="Random seed for shuffling few-shot examples")
     parser.add_argument("--permute_demonstrations", action="store_true", default=False,
@@ -418,8 +492,9 @@ def main():
     if args.few_shot_indices:
         indices = [int(x.strip()) for x in args.few_shot_indices.split(',')]
         if accelerator.is_main_process:
-            logger.info(f"Loading few-shot examples from test split with indices: {indices}")
-        few_shot_examples = load_few_shot_examples(args.dataset_name, indices, args.few_shot_random_seed, args.permute_demonstrations)
+            logger.info(f"Loading few-shot examples from train split with indices: {indices}")
+        # few_shot_examples = load_few_shot_examples(args.dataset_name, indices, args.few_shot_random_seed, args.permute_demonstrations)
+        few_shot_examples = load_few_shot_examples_from_bt_scores(bt_scores_file="gpt4_pairwise_preferences_test_0shot_cot_20trials_bt_scores.json", indices=indices, random_seed=args.few_shot_random_seed, permute_demonstrations=args.permute_demonstrations)
         if accelerator.is_main_process:
             logger.info(f"Loaded {len(few_shot_examples)} few-shot examples")
 
@@ -473,7 +548,7 @@ def main():
             batch_results = get_preference_probabilities_batch_accelerate(
                 model, batch, token_a_id, token_b_id, accelerator
             )
-            breakpoint()
+
             # Combine with metadata
             for i, (prob_a_over_b, logit_a, logit_b) in enumerate(batch_results):
                 metadata = batch['metadata'][i]
