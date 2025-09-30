@@ -11,7 +11,6 @@ import numpy as np
 import argparse
 from pathlib import Path
 from datasets import Dataset, DatasetDict
-from huggingface_hub import HfApi
 from typing import Dict, List, Tuple, Optional
 
 def correct_preference_matrix(matrix):
@@ -51,13 +50,70 @@ def correct_preference_matrix(matrix):
     
     return corrected
 
+def bradley_terry_scores(preference_matrix, max_iter=1000, tol=1e-6):
+    """
+    Fit Bradley-Terry model to a preference matrix.
+
+    Uses the iterative algorithm to find maximum likelihood estimates of scores
+    such that P(i > j) = score_i / (score_i + score_j)
+
+    Args:
+        preference_matrix: n×n matrix where entry [i,j] is P(response_i > response_j)
+        max_iter: Maximum number of iterations
+        tol: Convergence tolerance
+
+    Returns:
+        scores: Array of Bradley-Terry scores for each response
+    """
+    matrix = np.array(preference_matrix, dtype=float)
+    n = matrix.shape[0]
+
+    # Initialize scores to 1.0
+    scores = np.ones(n)
+
+    for iteration in range(max_iter):
+        scores_old = scores.copy()
+
+        # Update each score using the MM (Minorization-Maximization) algorithm
+        for i in range(n):
+            numerator = 0
+            denominator = 0
+
+            for j in range(n):
+                if i != j and not np.isnan(matrix[i, j]) and not np.isnan(matrix[j, i]):
+                    # Number of comparisons (here we use the probabilities directly)
+                    w_ij = matrix[i, j]  # P(i > j)
+                    w_ji = matrix[j, i]  # P(j > i)
+
+                    # Total comparisons between i and j
+                    n_ij = 1.0  # We treat each probability as representing 1 comparison
+
+                    # Wins for i over j (weighted by probability)
+                    numerator += w_ij * n_ij
+
+                    # Expected denominator
+                    denominator += n_ij / (scores_old[i] + scores_old[j])
+
+            if denominator > 0:
+                scores[i] = numerator / denominator
+
+        # Normalize to prevent overflow/underflow
+        scores = scores / np.mean(scores)
+
+        # Check convergence
+        if np.max(np.abs(scores - scores_old)) < tol:
+            break
+
+    return scores
+
+
 def find_most_extreme_preference(matrix):
     """
     Find the pair with the most extreme preference (closest to 0 or 1).
-    
+
     Args:
         matrix: Corrected preference matrix
-        
+
     Returns:
         chosen_idx: Index of chosen response
         rejected_idx: Index of rejected response
@@ -91,6 +147,28 @@ def find_most_extreme_preference(matrix):
     return best_chosen_idx, best_rejected_idx, best_prob, max_confidence
 
 
+def find_bradley_terry_preference(matrix):
+    """
+    Find chosen/rejected pair using Bradley-Terry scores.
+    Chosen is the highest scoring response, rejected is the lowest.
+
+    Args:
+        matrix: Corrected preference matrix
+
+    Returns:
+        chosen_idx: Index of chosen response (highest BT score)
+        rejected_idx: Index of rejected response (lowest BT score)
+        chosen_score: BT score of chosen response
+        rejected_score: BT score of rejected response
+    """
+    bt_scores = bradley_terry_scores(matrix)
+
+    chosen_idx = np.argmax(bt_scores)
+    rejected_idx = np.argmin(bt_scores)
+
+    return chosen_idx, rejected_idx, bt_scores[chosen_idx], bt_scores[rejected_idx]
+
+
 def create_conversation_format(prompt: str, response: str) -> List[Dict[str, str]]:
     """Create the conversation format expected by the dataset."""
     return [
@@ -98,13 +176,17 @@ def create_conversation_format(prompt: str, response: str) -> List[Dict[str, str
         {"content": response, "role": "assistant"}
     ]
 
-def convert_to_preference_dataset(input_files: Dict[str, str], output_dir: str = None) -> DatasetDict:
+def convert_to_preference_dataset(input_files: Dict[str, str], output_dir: str = None,
+                                 selection_method: str = "extreme") -> DatasetDict:
     """
     Convert preference matrix results to preference dataset format.
 
     Args:
         input_files: Dict mapping split names to JSON file paths with preference matrices
         output_dir: Optional directory to save the dataset
+        selection_method: Method for selecting chosen/rejected pairs:
+            - "extreme": Select pair with most extreme preference (closest to 0 or 1)
+            - "bradley_terry": Select best vs worst response using Bradley-Terry scores
 
     Returns:
         DatasetDict object with splits in the target format
@@ -120,6 +202,7 @@ def convert_to_preference_dataset(input_files: Dict[str, str], output_dir: str =
             results = json.load(f)
 
         print(f"Loaded {len(results)} samples for {split_name}")
+        print(f"Using selection method: {selection_method}")
 
         dataset_entries = []
         skipped_samples = 0
@@ -133,8 +216,13 @@ def convert_to_preference_dataset(input_files: Dict[str, str], output_dir: str =
                 # Correct the preference matrix
                 corrected_matrix = correct_preference_matrix(raw_matrix)
 
-                # Find the most extreme preference
-                chosen_idx, rejected_idx, preference_prob, confidence = find_most_extreme_preference(corrected_matrix)
+                # Select chosen/rejected pair based on method
+                if selection_method == "extreme":
+                    chosen_idx, rejected_idx, _, _ = find_most_extreme_preference(corrected_matrix)
+                elif selection_method == "bradley_terry":
+                    chosen_idx, rejected_idx, _, _ = find_bradley_terry_preference(corrected_matrix)
+                else:
+                    raise ValueError(f"Unknown selection method: {selection_method}")
 
                 # Create dataset entry with only essential columns
                 entry = {
@@ -266,9 +354,12 @@ def main():
                        help="Make the repository private")
     parser.add_argument("--dry_run", action="store_true", default=False,
                        help="Create dataset but don't push to hub")
-    
+    parser.add_argument("--selection_method", type=str, default="bradley_terry",
+                       choices=["extreme", "bradley_terry"],
+                       help="Method for selecting chosen/rejected pairs: 'extreme' (most extreme preference) or 'bradley_terry' (best vs worst BT score)")
+
     args = parser.parse_args()
-    
+
     # Prepare input files dict
     input_files = {
         'train': args.train_file,
@@ -279,6 +370,7 @@ def main():
     dataset_dict = convert_to_preference_dataset(
         input_files,
         args.output_dir,
+        selection_method=args.selection_method,
     )
 
     # Calculate statistics
