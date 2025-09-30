@@ -24,6 +24,8 @@ import time
 import random
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
+import torch.distributed as dist
+from datetime import timedelta
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -189,7 +191,7 @@ def make_collate_fn(tokenizer, max_length=None):
     return _collate_fn
 
 
-def load_few_shot_examples(dataset_name, indices, random_seed=42):
+def load_few_shot_examples(dataset_name, indices, random_seed=42, permute_demonstrations=True):
     """Load few-shot examples from test split based on specified indices."""
     try:
         test_dataset = load_dataset(dataset_name, split='test')
@@ -211,22 +213,22 @@ def load_few_shot_examples(dataset_name, indices, random_seed=42):
             chosen = chosen_raw[-1]['content']
             rejected = rejected_raw[-1]['content']
 
-            # Create two examples: one with A=chosen, B=rejected (label=A)
-            # and one with A=rejected, B=chosen (label=B)
-            examples.extend([
-                {
-                    'question': question,
-                    'response_a': chosen,
-                    'response_b': rejected,
-                    'label': 'A'
-                },
-                {
+            # Create first example: A=chosen, B=rejected (label=A)
+            examples.append({
+                'question': question,
+                'response_a': chosen,
+                'response_b': rejected,
+                'label': 'A'
+            })
+
+            # Create second example only if permute_demonstrations is True
+            if permute_demonstrations:
+                examples.append({
                     'question': question,
                     'response_a': rejected,
                     'response_b': chosen,
                     'label': 'B'
-                }
-            ])
+                })
 
         # Shuffle the examples to avoid order bias
         random.seed(random_seed)
@@ -246,7 +248,7 @@ def parse_args():
                        help="Dataset name from HuggingFace")
     parser.add_argument("--split", type=str, default="train",
                        help="Split of the dataset to process")
-    parser.add_argument("--batch_size", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size per device for processing comparisons")
     parser.add_argument("--max_samples", type=int, default=None,
                        help="Maximum number of samples to process (for testing)")
@@ -256,10 +258,12 @@ def parse_args():
                        help="Whether to use Flash Attention 2 if available")
     parser.add_argument("--max_length", type=int, default=None,
                        help="Maximum sequence length for tokenization (None for no truncation)")
-    parser.add_argument("--few_shot_indices", type=str, default="0,1,2,3",
-                       help="Comma-separated indices of test examples to use for few-shot (e.g., '0,1,2,3')")
+    parser.add_argument("--few_shot_indices", type=str, default="30,3,37,18",
+                       help="Comma-separated indices of test examples to use for few-shot (e.g., '30,3,37,18')")
     parser.add_argument("--few_shot_random_seed", type=int, default=42,
                        help="Random seed for shuffling few-shot examples")
+    parser.add_argument("--permute_demonstrations", action="store_true", default=False,
+                       help="Whether to create permuted demonstrations by swapping response order")
     return parser.parse_args()
 
 def get_preference_probabilities_batch_accelerate(model, batch, token_a_id, token_b_id, accelerator):
@@ -415,7 +419,7 @@ def main():
         indices = [int(x.strip()) for x in args.few_shot_indices.split(',')]
         if accelerator.is_main_process:
             logger.info(f"Loading few-shot examples from test split with indices: {indices}")
-        few_shot_examples = load_few_shot_examples(args.dataset_name, indices, args.few_shot_random_seed)
+        few_shot_examples = load_few_shot_examples(args.dataset_name, indices, args.few_shot_random_seed, args.permute_demonstrations)
         if accelerator.is_main_process:
             logger.info(f"Loaded {len(few_shot_examples)} few-shot examples")
 
@@ -469,7 +473,7 @@ def main():
             batch_results = get_preference_probabilities_batch_accelerate(
                 model, batch, token_a_id, token_b_id, accelerator
             )
-            
+            breakpoint()
             # Combine with metadata
             for i, (prob_a_over_b, logit_a, logit_b) in enumerate(batch_results):
                 metadata = batch['metadata'][i]
@@ -502,20 +506,40 @@ def main():
             continue
     
     # Gather all results from all processes
-    if accelerator.is_main_process:
-        logger.info("Gathering results from all processes...")
+    # if accelerator.is_main_process:
+    #     logger.info("Gathering results from all processes...")
     
-    gathered_results = gather_object(all_results)
+    # gathered_results = gather_object(all_results)
+
+    rank = accelerator.process_index
+    permute_suffix = "permuted" if args.permute_demonstrations else "no_permute"
+    part_file = f"pairwise_preferences_{args.split}_{len(indices)}_shot_{permute_suffix}_rank_{rank}.json"
+
+    with open(part_file, "w") as f:
+        for item in all_results:  # make sure items are JSON-serializable (lists/dicts/numbers/strings)
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    accelerator.wait_for_everyone()
     
     # Only main process handles final processing and saving
     if accelerator.is_main_process:
-        logger.info(f"Gathered {len(gathered_results)} comparison results")
-        
+        # logger.info(f"Gathered {len(gathered_results)} comparison results")
+        gathered_results = []
+        for r in range(accelerator.num_processes):
+            with open(f"pairwise_preferences_{args.split}_{len(indices)}_shot_{permute_suffix}_rank_{r}.json") as f:
+                for line in f:
+                    gathered_results.append(json.loads(line))
+
+        with open(f"pairwise_preferences_{args.split}_{len(indices)}_shot_{permute_suffix}_gathered.json", "w") as f:
+            for item in gathered_results:
+                f.write(json.dumps(item) + "\n")
+                
         # Reconstruct preference matrices
         final_results = reconstruct_preference_matrices(gathered_results)
         
         # Save results
-        output_file = f"pairwise_preferences_accelerate_{args.split}.json"
+        permute_suffix = "permuted" if args.permute_demonstrations else "no_permute"
+        output_file = f"pairwise_preferences_{args.split}_{len(indices)}_shot_{permute_suffix}_temp.json"
         logger.info(f"Saving results to {output_file}")
         with open(output_file, 'w') as f:
             json.dump(final_results, f, indent=2)
