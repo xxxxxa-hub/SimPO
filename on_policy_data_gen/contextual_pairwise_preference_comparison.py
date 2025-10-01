@@ -492,7 +492,10 @@ def main():
     # Load few-shot examples if specified
     few_shot_examples = []
     if args.few_shot_indices:
-        indices = [int(x.strip()) for x in args.few_shot_indices.split(',')]
+        try:
+            indices = [int(x.strip()) for x in args.few_shot_indices.split(',')]
+        except:
+            indices = []
         if accelerator.is_main_process:
             logger.info(f"Loading few-shot examples from train split with indices: {indices}")
         # few_shot_examples = load_few_shot_examples(args.dataset_name, indices, args.few_shot_random_seed, args.permute_demonstrations)
