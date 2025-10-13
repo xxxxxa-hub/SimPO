@@ -255,7 +255,7 @@ def main():
         all_results.append(result)
 
     # Save results
-    output_file = f"gpt4_pairwise_preferences_{args.split}_0shot_cot_{args.num_trials}trials.json"
+    output_file = f"gpt4_pairwise_preferences_{args.split}_{len(prompt_indices)}shot_cot_{args.num_trials}trials.json"
     logger.info(f"\nSaving results to {output_file}")
     with open(output_file, 'w') as f:
         json.dump(all_results, f, indent=2)
