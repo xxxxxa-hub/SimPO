@@ -335,11 +335,13 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=None,
                        help="Maximum sequence length for tokenization (None for no truncation)")
     parser.add_argument("--few_shot_indices", type=str, default="30,3,37,18",
-                       help="Comma-separated indices of train examples to use for few-shot (e.g., '30,3,37,18')")
+                       help="Comma-separated indices of train examples to use for few-shot (e.g., '30,3,37,18')") # 23,47,5,61,38,14,69,52
     parser.add_argument("--few_shot_random_seed", type=int, default=42,
                        help="Random seed for shuffling few-shot examples")
     parser.add_argument("--permute_demonstrations", action="store_true", default=False,
                        help="Whether to create permuted demonstrations by swapping response order")
+    parser.add_argument("--use_bt_scores", action="store_true", default=False,
+                       help="Use load_few_shot_examples_from_bt_scores (GPT-labeled JSON) instead of load_few_shot_examples (dataset labels)")
     return parser.parse_args()
 
 def get_preference_probabilities_batch_accelerate(model, batch, token_a_id, token_b_id, accelerator):
@@ -496,10 +498,31 @@ def main():
             indices = [int(x.strip()) for x in args.few_shot_indices.split(',')]
         except:
             indices = []
-        if accelerator.is_main_process:
-            logger.info(f"Loading few-shot examples from train split with indices: {indices}")
-        # few_shot_examples = load_few_shot_examples(args.dataset_name, indices, args.few_shot_random_seed, args.permute_demonstrations)
-        few_shot_examples = load_few_shot_examples_from_bt_scores(bt_scores_file="gpt4_pairwise_preferences_test_0shot_cot_20trials_bt_scores.json", indices=indices, random_seed=args.few_shot_random_seed, permute_demonstrations=args.permute_demonstrations)
+
+        if args.use_bt_scores:
+            # Use Bradley-Terry scores from GPT-labeled JSON file
+            bt_scores_file = f"gpt4_pairwise_preferences_test_{len(indices)}shot_cot_20trials_bt_scores.json"
+            if accelerator.is_main_process:
+                logger.info(f"Loading few-shot examples from Bradley-Terry scores file: {bt_scores_file}")
+                logger.info(f"Using indices: {indices}")
+            few_shot_examples = load_few_shot_examples_from_bt_scores(
+                bt_scores_file=bt_scores_file,
+                indices=indices,
+                random_seed=args.few_shot_random_seed,
+                permute_demonstrations=args.permute_demonstrations
+            )
+        else:
+            # Use labels from dataset
+            if accelerator.is_main_process:
+                logger.info(f"Loading few-shot examples from dataset: {args.dataset_name}")
+                logger.info(f"Using indices: {indices}")
+            few_shot_examples = load_few_shot_examples(
+                dataset_name=args.dataset_name,
+                indices=indices,
+                random_seed=args.few_shot_random_seed,
+                permute_demonstrations=args.permute_demonstrations
+            )
+
         if accelerator.is_main_process:
             logger.info(f"Loaded {len(few_shot_examples)} few-shot examples")
 
