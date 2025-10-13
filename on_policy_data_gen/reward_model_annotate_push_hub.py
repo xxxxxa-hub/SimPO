@@ -10,7 +10,7 @@ import datasets
 from datasets import load_dataset
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input_dataset", type=str, default=None, help="HuggingFace dataset ID to load (e.g., 'username/dataset-name')")
+parser.add_argument("--input_dataset", type=str, default="Alligator123/gemma2-ultrafeedback-armorm-false_qa", help="HuggingFace dataset ID to load (e.g., 'username/dataset-name')")
 parser.add_argument("--generation_file", type=str, default=None, help="Path to the output generation file (alternative to --input_dataset)")
 parser.add_argument("--reward_model", type=str, default="RLHFlow/ArmoRM-Llama3-8B-v0.1", help="Path to reward model")
 parser.add_argument("--output_dir", type=str, default=None, help="Path to output directory (for local saving)")
@@ -52,8 +52,12 @@ candidates_texts = [data["all_generated_responses"] for data in output_data]
 
 model = AutoModelForSequenceClassification.from_pretrained(args.reward_model, 
                                                            device_map="cuda", 
-                                                           trust_remote_code=True, torch_dtype=torch.bfloat16)
-tokenizer = AutoTokenizer.from_pretrained(args.reward_model, use_fast=True)
+                                                           trust_remote_code=True, 
+                                                           torch_dtype=torch.bfloat16,
+                                                           attn_implementation="flash_attention_2",
+                                                           num_labels=1)
+
+tokenizer = AutoTokenizer.from_pretrained(args.reward_model)
 
 for data in tqdm.tqdm(output_data):
     prompt = data["prompt"]
@@ -62,10 +66,13 @@ for data in tqdm.tqdm(output_data):
     for candidate in candidates:
         messages = [{"role": "user", "content": prompt},
                     {"role": "assistant", "content": candidate}]
-        input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt").to("cuda")
+        messages_formatted = tokenizer.apply_chat_template(messages, tokenize=False)
+        if tokenizer.bos_token is not None and messages_formatted.startswith(tokenizer.bos_token):
+            messages_formatted = messages_formatted[len(tokenizer.bos_token):]
+        input_ids = tokenizer(messages_formatted, return_tensors="pt").to("cuda")
         with torch.no_grad():
-            output = model(input_ids)
-            score = output.score.float().item()
+            output = model(**input_ids)
+            score = output.logits[0][0].item()
             scores.append(score)
     data["all_rm_scores"] = scores
 
