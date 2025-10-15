@@ -141,8 +141,12 @@ def parse_args():
                        help="Dataset name from HuggingFace")
     parser.add_argument("--split", type=str, default="test",
                        help="Split of the dataset to process")
-    parser.add_argument("--prompt_indices", type=str, default="30,3,37,18",
+    parser.add_argument("--prompt_indices", type=str, default=None,
                        help="Comma-separated indices of prompts to evaluate (e.g., '30,3,37,18')")
+    parser.add_argument("--num_random_prompts", type=int, default=None,
+                       help="Number of random prompts to select from dataset (alternative to --prompt_indices)")
+    parser.add_argument("--random_seed", type=int, default=42,
+                       help="Random seed for prompt selection (default: 42)")
     parser.add_argument("--api_key", type=str, default=None,
                        help="OpenAI API key (or set OPENAI_API_KEY env variable)")
     parser.add_argument("--rate_limit_delay", type=float, default=0.5,
@@ -172,9 +176,23 @@ def main():
     # Load dataset
     dataset = load_dataset(args.dataset_name, split=args.split)
 
-    # Parse prompt indices
-    prompt_indices = [int(x.strip()) for x in args.prompt_indices.split(',')]
-    logger.info(f"Processing {len(prompt_indices)} prompts with indices: {prompt_indices}")
+    # Determine prompt indices
+    if args.prompt_indices is not None and args.num_random_prompts is not None:
+        raise ValueError("Cannot specify both --prompt_indices and --num_random_prompts. Choose one.")
+    elif args.prompt_indices is not None:
+        # Parse prompt indices
+        prompt_indices = [int(x.strip()) for x in args.prompt_indices.split(',')]
+        logger.info(f"Processing {len(prompt_indices)} prompts with indices: {prompt_indices}")
+    elif args.num_random_prompts is not None:
+        # Randomly select prompts
+        np.random.seed(args.random_seed)
+        dataset_size = len(dataset)
+        if args.num_random_prompts > dataset_size:
+            raise ValueError(f"--num_random_prompts ({args.num_random_prompts}) cannot be larger than dataset size ({dataset_size})")
+        prompt_indices = np.random.choice(dataset_size, size=args.num_random_prompts, replace=False).tolist()
+        logger.info(f"Randomly selected {len(prompt_indices)} prompts with seed {args.random_seed}: {prompt_indices}")
+    else:
+        raise ValueError("Must specify either --prompt_indices or --num_random_prompts")
 
     # Verify indices are valid
     for idx in prompt_indices:
