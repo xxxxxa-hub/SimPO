@@ -56,8 +56,8 @@ class PairwiseComparisonDataset(Dataset):
     def _prepare_comparisons(self):
         """Pre-generate all comparison pairs across all samples."""
         for sample_idx, sample in enumerate(self.dataset):
-            prompt = sample["prompt"]
-            all_responses = sample["all_generated_responses"]
+            prompt = sample["prompt"].strip()
+            all_responses = [r.strip() for r in sample["all_generated_responses"]]
 
             # Ensure we have exactly 5 responses
             if len(all_responses) != 5:
@@ -101,28 +101,24 @@ class PairwiseComparisonDataset(Dataset):
 
             for i, example in enumerate(randomized_examples):
                 prompt_text += f"# Example {i + 1}\n"
-                prompt_text += f"## Question\n{example['question']}\n\n"
-                prompt_text += f"[The Start of Assistant A's Answer]\n{example['response_a']}\n"
-                prompt_text += f"[The End of Assistant A's Answer]\n\n"
-                prompt_text += f"[The Start of Assistant B's Answer]\n{example['response_b']}\n"
-                prompt_text += f"[The End of Assistant B's Answer]\n\n"
-                prompt_text += f"## Preferred answer: [[{example['label']}]]\n\n"
+                prompt_text += f"## Question\n{example['question']}\n"
+                prompt_text += f"## Response A\n{example['response_a']}\n"
+                prompt_text += f"## Response B\n{example['response_b']}\n"
+                prompt_text += f"## Preferred response: [[{example['label']}]]\n\n"
 
         # Add task header with brief instruction
         prompt_text += "# Task\n"
         if self.few_shot_examples:
-            prompt_text += "Given the examples above, evaluate the quality of two AI assistants' responses. "
+            prompt_text += "Given the examples above, evaluate the quality of two responses to the following question.\n"
         else:
-            prompt_text += "Evaluate the quality of two AI assistants' responses. "
+            prompt_text += "Evaluate the quality of two responses to the following question.\n"
         # prompt_text += 'Output your verdict as "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.\n\n'
 
         # Add the current query
-        prompt_text += f"## Question\n{question}\n\n"
-        prompt_text += f"[The Start of Assistant A's Answer]\n{response_a}\n"
-        prompt_text += f"[The End of Assistant A's Answer]\n\n"
-        prompt_text += f"[The Start of Assistant B's Answer]\n{response_b}\n"
-        prompt_text += f"[The End of Assistant B's Answer]\n\n"
-        prompt_text += "## Preferred answer: [["
+        prompt_text += f"## Question\n{question}\n"
+        prompt_text += f"## Response A\n{response_a}\n"
+        prompt_text += f"## Response B\n{response_b}\n"
+        prompt_text += "## Preferred response: [["
 
         return prompt_text
 
@@ -209,8 +205,8 @@ def load_few_shot_examples_from_bt_scores(bt_scores_file, indices):
 
             sample = bt_data[idx]
 
-            question = sample.get('prompt', '')
-            responses = sample.get('responses', [])
+            question = sample.get('prompt', '').strip()
+            responses = [r.strip() for r in sample.get('responses', [])]
             bt_scores = sample.get('bt_scores', [])
             rankings = sample.get('rankings', [])
 
@@ -222,8 +218,8 @@ def load_few_shot_examples_from_bt_scores(bt_scores_file, indices):
             best_idx = rankings[0]  # First in rankings = highest score
             worst_idx = rankings[-1]  # Last in rankings = lowest score
 
-            chosen = responses[best_idx]
-            rejected = responses[worst_idx]
+            chosen = responses[best_idx].strip()
+            rejected = responses[worst_idx].strip()
 
             # Create first example: A=chosen, B=rejected (label=A)
             examples.append({
@@ -489,7 +485,7 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
 
     # Save intermediate results per rank
     rank = accelerator.process_index
-    part_file = f"{args.output_dir}/seed_{seed}_rank_{rank}_new_prompt_3.jsonl"
+    part_file = f"{args.output_dir}/seed_{seed}_rank_{rank}_new_prompt_4.jsonl"
     os.makedirs(args.output_dir, exist_ok=True)
 
     with open(part_file, "w") as f:
@@ -503,7 +499,7 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         # Gather results from all ranks
         gathered_results = []
         for r in range(accelerator.num_processes):
-            rank_file = f"{args.output_dir}/seed_{seed}_rank_{r}_new_prompt_3.jsonl"
+            rank_file = f"{args.output_dir}/seed_{seed}_rank_{r}_new_prompt_4.jsonl"
             with open(rank_file) as f:
                 for line in f:
                     gathered_results.append(json.loads(line))
@@ -514,13 +510,13 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         final_results = reconstruct_preference_matrices(gathered_results)
 
         # Save final results for this seed
-        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{args.k_shot}_new_prompt_3.json"
+        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{args.k_shot}_new_prompt_4.json"
         logger.info(f"Saving results to {output_file}")
         with open(output_file, 'w') as f:
             json.dump(final_results, f, indent=2)
 
         # Also save metadata about the experiment
-        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{args.k_shot}_new_prompt_3.json"
+        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{args.k_shot}_new_prompt_4.json"
         metadata = {
             "seed": seed,
             "k_shot": args.k_shot,
