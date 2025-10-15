@@ -51,8 +51,8 @@ class PairwiseComparisonDataset(Dataset):
     def _prepare_comparisons(self):
         """Pre-generate all comparison pairs across all samples."""
         for sample_idx, sample in enumerate(self.dataset):
-            prompt = sample["prompt"]
-            all_responses = sample["all_generated_responses"]
+            prompt = sample["prompt"].strip()
+            all_responses = [r.strip() for r in sample["all_generated_responses"]]
             
             # Ensure we have exactly 5 responses
             if len(all_responses) != 5:
@@ -208,12 +208,12 @@ def load_few_shot_examples(dataset_name, indices, random_seed=42, permute_demons
 
             # Assume the dataset has 'prompt', 'chosen', and 'rejected' fields
             # If the format is different, we'll need to adapt this
-            question = sample.get('prompt', sample.get('question', ''))
+            question = sample.get('prompt', sample.get('question', '')).strip()
             chosen_raw = sample.get('chosen', sample.get('response_a', ''))
             rejected_raw = sample.get('rejected', sample.get('response_b', ''))
 
-            chosen = chosen_raw[-1]['content']
-            rejected = rejected_raw[-1]['content']
+            chosen = chosen_raw[-1]['content'].strip()
+            rejected = rejected_raw[-1]['content'].strip()
 
             # Create first example: A=chosen, B=rejected (label=A)
             examples.append({
@@ -272,8 +272,8 @@ def load_few_shot_examples_from_bt_scores(bt_scores_file, indices, random_seed=4
                 logger.warning(f"Sample ID {idx} not found in Bradley-Terry scores file")
                 continue
 
-            question = sample.get('prompt', '')
-            responses = sample.get('responses', [])
+            question = sample.get('prompt', '').strip()
+            responses = [r.strip() for r in sample.get('responses', [])]
             bt_scores = sample.get('bt_scores', [])
             rankings = sample.get('rankings', [])
 
@@ -285,8 +285,8 @@ def load_few_shot_examples_from_bt_scores(bt_scores_file, indices, random_seed=4
             best_idx = rankings[0]  # First in rankings = highest score
             worst_idx = rankings[-1]  # Last in rankings = lowest score
 
-            chosen = responses[best_idx]
-            rejected = responses[worst_idx]
+            chosen = responses[best_idx].strip()
+            rejected = responses[worst_idx].strip()
 
             # Create first example: A=chosen, B=rejected (label=A)
             examples.append({
