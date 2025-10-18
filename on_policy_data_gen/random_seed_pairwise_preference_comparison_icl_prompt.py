@@ -90,7 +90,14 @@ class PairwiseComparisonDataset(Dataset):
         """
 
         # Build the prompt as a single string with few-shot examples
-        prompt_text = ""
+        prompt_text = (
+            "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "
+            "You should choose the assistant that follows the user's instructions and answers the user's question better. Your evaluation should consider "
+            "factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. Avoid any position biases and ensure that the order in which the responses were "
+            "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
+            "of the assistants. Be as objective as possible. After careful consideration, output your final verdict by strictly following this format: "
+            '"[[A]]" if assistant A is better, "[[B]]" if assistant B is better.\n\n'
+        )
 
         # Randomize few-shot examples order for this query
         if self.few_shot_examples:
@@ -109,11 +116,11 @@ class PairwiseComparisonDataset(Dataset):
                 prompt_text += f"## Preferred answer: [[{example['label']}]]\n\n"
 
         # Add task header with brief instruction
-        prompt_text += "# Task\n"
+        # prompt_text += "# Task\n"
         if self.few_shot_examples:
-            prompt_text += "Given the examples above, evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy. "
+            prompt_text += "Given the examples above, evaluate the quality of two responses to the following question. "
         else:
-            prompt_text += "Evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy. "
+            prompt_text += "Evaluate the quality of two responses to the following question. "
         # prompt_text += 'Output your verdict as "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.\n\n'
 
         # Add the current query
@@ -489,7 +496,7 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
 
     # Save intermediate results per rank
     rank = accelerator.process_index
-    part_file = f"{args.output_dir}/seed_{seed}_rank_{rank}_new_prompt_6.jsonl"
+    part_file = f"{args.output_dir}/seed_{seed}_rank_{rank}_new_prompt_7.jsonl"
     os.makedirs(args.output_dir, exist_ok=True)
 
     with open(part_file, "w") as f:
@@ -503,7 +510,7 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         # Gather results from all ranks
         gathered_results = []
         for r in range(accelerator.num_processes):
-            rank_file = f"{args.output_dir}/seed_{seed}_rank_{r}_new_prompt_6.jsonl"
+            rank_file = f"{args.output_dir}/seed_{seed}_rank_{r}_new_prompt_7.jsonl"
             with open(rank_file) as f:
                 for line in f:
                     gathered_results.append(json.loads(line))
@@ -514,13 +521,13 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         final_results = reconstruct_preference_matrices(gathered_results)
 
         # Save final results for this seed
-        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{args.k_shot}_new_prompt_6.json"
+        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{args.k_shot}_new_prompt_7.json"
         logger.info(f"Saving results to {output_file}")
         with open(output_file, 'w') as f:
             json.dump(final_results, f, indent=2)
 
         # Also save metadata about the experiment
-        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{args.k_shot}_new_prompt_6.json"
+        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{args.k_shot}_new_prompt_7.json"
         metadata = {
             "seed": seed,
             "k_shot": args.k_shot,
