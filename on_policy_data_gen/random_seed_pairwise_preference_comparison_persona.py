@@ -397,7 +397,9 @@ def parse_args():
     parser.add_argument("--split", type=str, default="train",
                        help="Split of the dataset to process")
     parser.add_argument("--persona_id", type=str, default=None,
-                       help="Specific persona UUID to filter for. If None, uses first persona found.")
+                       help="Specific persona UUID to filter for. If None, uses first persona found (used if --persona_ids not provided).")
+    parser.add_argument("--persona_ids", type=str, nargs='+', default=None,
+                       help="Multiple persona UUIDs to run experiments for (e.g., --persona_ids uuid1 uuid2 uuid3)")
     parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size per device for processing comparisons")
     parser.add_argument("--max_samples", type=int, default=512,
@@ -409,7 +411,9 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=None,
                        help="Maximum sequence length for tokenization (None for no truncation)")
     parser.add_argument("--k_shot", type=int, default=4,
-                       help="Number of few-shot examples to sample from persona data as demonstrations")
+                       help="Number of few-shot examples to sample from persona data as demonstrations (used if --k_shots not provided)")
+    parser.add_argument("--k_shots", type=int, nargs='+', default=None,
+                       help="Multiple k-shot values to run experiments for (e.g., --k_shots 2 4 8)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for few-shot sampling and demonstration order (used if --seeds not provided)")
     parser.add_argument("--seeds", type=int, nargs='+', default=None,
@@ -541,17 +545,19 @@ def reconstruct_preference_matrices(all_comparison_results):
 
     return final_results, accuracy_metrics
 
-def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_id, token_b_id, persona_data, persona_id=None):
-    """Run the preference comparison experiment for a single seed.
+def run_experiment_for_seed(seed, k_shot, args, accelerator, model, tokenizer, token_a_id, token_b_id, persona_data, persona_id=None):
+    """Run the preference comparison experiment for a single seed and k_shot combination.
 
     Args:
+        seed: Random seed for few-shot sampling and demonstration order
+        k_shot: Number of few-shot examples to use
         persona_data: List of persona dataset samples in converted format
         persona_id: The persona UUID being used
     """
 
     if accelerator.is_main_process:
         logger.info(f"\n{'='*80}")
-        logger.info(f"Running experiment with seed: {seed}")
+        logger.info(f"Running experiment with seed: {seed}, k_shot: {k_shot}")
         logger.info(f"{'='*80}")
 
     # Total available samples for this persona
@@ -574,13 +580,13 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         logger.info(f"Holdout set size: {len(holdout_indices)} samples")
 
     # Now sample k-shot demonstrations from the holdout set using the seed
-    if len(holdout_indices) < args.k_shot:
-        raise ValueError(f"Not enough holdout samples ({len(holdout_indices)}) to sample {args.k_shot} few-shot examples. "
+    if len(holdout_indices) < k_shot:
+        raise ValueError(f"Not enough holdout samples ({len(holdout_indices)}) to sample {k_shot} few-shot examples. "
                         f"Reduce max_samples or k_shot.")
 
     few_shot_indices = sample_few_shot_indices(
         num_annotated=len(holdout_indices),
-        k_shot=args.k_shot,
+        k_shot=k_shot,
         seed=seed
     )
     # Map back to original indices in persona_data
@@ -716,17 +722,17 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         logger.info(f"Correct predictions: {accuracy_metrics['correct_predictions']}/{accuracy_metrics['total_predictions']}")
         logger.info(f"{'='*80}\n")
 
-        # Save final results for this seed
-        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{args.k_shot}_persona_{persona_str}.json"
+        # Save final results for this seed and k_shot
+        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{k_shot}_persona_{persona_str}.json"
         logger.info(f"Saving results to {output_file}")
         with open(output_file, 'w') as f:
             json.dump(final_results, f, indent=2)
 
         # Also save metadata about the experiment
-        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{args.k_shot}_persona_{persona_str}.json"
+        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{k_shot}_persona_{persona_str}.json"
         metadata = {
             "seed": seed,
-            "k_shot": args.k_shot,
+            "k_shot": k_shot,
             "few_shot_indices": few_shot_indices,
             "num_test_samples": len(final_results),
             "total_persona_samples": total_samples,
@@ -739,7 +745,7 @@ def run_experiment_for_seed(seed, args, accelerator, model, tokenizer, token_a_i
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        logger.info(f"Seed {seed} complete. Processed {len(final_results)} samples with {accuracy_metrics['accuracy']*100:.2f}% accuracy")
+        logger.info(f"Seed {seed}, k_shot {k_shot} complete. Processed {len(final_results)} samples with {accuracy_metrics['accuracy']*100:.2f}% accuracy")
 
         total_time = time.time() - start_time
         logger.info(f"Time for seed {seed}: {total_time / 60:.1f} minutes")
@@ -826,24 +832,29 @@ def main():
 
     dataset = load_dataset(args.dataset_name, split=args.split)
 
-    # Filter by persona
-    if accelerator.is_main_process:
-        logger.info(f"Filtering dataset by persona...")
+    # Determine which persona_ids to use
+    if args.persona_ids is not None:
+        persona_ids_to_run = args.persona_ids
+        if accelerator.is_main_process:
+            logger.info(f"Running experiments for multiple personas: {persona_ids_to_run}")
+    else:
+        # Use single persona_id or auto-detect
+        persona_ids_to_run = [args.persona_id]  # Can be [None] for auto-detection
+        if accelerator.is_main_process:
+            if args.persona_id:
+                logger.info(f"Running experiment for single persona: {args.persona_id}")
+            else:
+                logger.info(f"Running experiment for auto-detected persona")
 
-    filtered_dataset, persona_id = filter_dataset_by_persona(dataset, args.persona_id)
-
-    if accelerator.is_main_process:
-        logger.info(f"Using persona: {persona_id}")
-        logger.info(f"Persona-filtered dataset size: {len(filtered_dataset)}")
-
-    # Convert persona dataset to expected format
-    if accelerator.is_main_process:
-        logger.info("Converting persona dataset to pairwise comparison format...")
-
-    persona_data = prepare_persona_dataset_as_pairwise(filtered_dataset)
-
-    if accelerator.is_main_process:
-        logger.info(f"Converted {len(persona_data)} samples")
+    # Determine which k_shot values to use
+    if args.k_shots is not None:
+        k_shots_to_run = args.k_shots
+        if accelerator.is_main_process:
+            logger.info(f"Running experiments for multiple k_shot values: {k_shots_to_run}")
+    else:
+        k_shots_to_run = [args.k_shot]
+        if accelerator.is_main_process:
+            logger.info(f"Running experiment for single k_shot: {args.k_shot}")
 
     # Determine which seeds to use
     if args.seeds is not None:
@@ -855,24 +866,68 @@ def main():
         if accelerator.is_main_process:
             logger.info(f"Running experiment for single seed: {args.seed}")
 
-    # Run experiment for each seed
-    # Note: max_samples will be used to limit test set size (after excluding k_shot demonstrations)
-    for seed in seeds_to_run:
-        run_experiment_for_seed(
-            seed=seed,
-            args=args,
-            accelerator=accelerator,
-            model=model,
-            tokenizer=tokenizer,
-            token_a_id=token_a_id,
-            token_b_id=token_b_id,
-            persona_data=persona_data,
-            persona_id=persona_id
-        )
+    # Calculate total number of experiments
+    total_experiments = len(persona_ids_to_run) * len(k_shots_to_run) * len(seeds_to_run)
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"GRID SEARCH CONFIGURATION")
+        logger.info(f"{'='*80}")
+        logger.info(f"Personas: {len(persona_ids_to_run)}")
+        logger.info(f"K-shot values: {len(k_shots_to_run)}")
+        logger.info(f"Seeds: {len(seeds_to_run)}")
+        logger.info(f"Total experiments: {total_experiments}")
+        logger.info(f"{'='*80}\n")
+
+    # Grid search loop
+    experiment_count = 0
+    for persona_id_to_filter in persona_ids_to_run:
+        # Filter by persona
+        if accelerator.is_main_process:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"Processing persona: {persona_id_to_filter if persona_id_to_filter else 'auto-detect'}")
+            logger.info(f"{'='*80}")
+
+        filtered_dataset, actual_persona_id = filter_dataset_by_persona(dataset, persona_id_to_filter)
+
+        if accelerator.is_main_process:
+            logger.info(f"Using persona: {actual_persona_id}")
+            logger.info(f"Persona-filtered dataset size: {len(filtered_dataset)}")
+
+        # Convert persona dataset to expected format
+        if accelerator.is_main_process:
+            logger.info("Converting persona dataset to pairwise comparison format...")
+
+        persona_data = prepare_persona_dataset_as_pairwise(filtered_dataset)
+
+        if accelerator.is_main_process:
+            logger.info(f"Converted {len(persona_data)} samples")
+
+        # Run experiments for all k_shot and seed combinations for this persona
+        for k_shot in k_shots_to_run:
+            for seed in seeds_to_run:
+                experiment_count += 1
+                if accelerator.is_main_process:
+                    logger.info(f"\n{'='*80}")
+                    logger.info(f"EXPERIMENT {experiment_count}/{total_experiments}")
+                    logger.info(f"Persona: {actual_persona_id}, K-shot: {k_shot}, Seed: {seed}")
+                    logger.info(f"{'='*80}")
+
+                run_experiment_for_seed(
+                    seed=seed,
+                    k_shot=k_shot,
+                    args=args,
+                    accelerator=accelerator,
+                    model=model,
+                    tokenizer=tokenizer,
+                    token_a_id=token_a_id,
+                    token_b_id=token_b_id,
+                    persona_data=persona_data,
+                    persona_id=actual_persona_id
+                )
 
     if accelerator.is_main_process:
         logger.info(f"\n{'='*80}")
-        logger.info(f"All experiments complete!")
+        logger.info(f"ALL {total_experiments} EXPERIMENTS COMPLETE!")
         logger.info(f"Results saved to: {args.output_dir}")
         logger.info(f"{'='*80}")
 
