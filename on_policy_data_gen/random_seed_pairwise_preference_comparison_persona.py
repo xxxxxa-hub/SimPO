@@ -355,12 +355,7 @@ def prepare_persona_dataset_as_pairwise(dataset):
     converted_data = []
     for sample in dataset:
         # Extract question
-        if isinstance(sample.get('question'), dict):
-            prompt = sample['question'].get('x', '')
-        elif isinstance(sample.get('question'), str):
-            prompt = sample['question']
-        else:
-            prompt = str(sample.get('question', ''))
+        prompt = sample['x']
 
         # Get the two responses (winner and loser)
         yw = sample.get('yw', '').strip()
