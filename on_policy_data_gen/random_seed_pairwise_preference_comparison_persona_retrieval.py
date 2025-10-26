@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+"""
+Script to generate pairwise preference comparisons with persona-based in-context learning.
+
+Workflow:
+1. Filters dataset to a single persona/user
+2. Splits data into test set (first max_samples) and holdout set (remaining samples)
+3. For each test query, retrieves k most similar examples from holdout set using embeddings
+4. Shuffles the retrieved demonstrations to avoid ordering bias
+5. Generates preference matrix comparing two responses (yw vs yl)
+"""
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import gather_object
+import json
+import os
+import argparse
+import tqdm
+import numpy as np
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
+import logging
+import time
+import random
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+import torch.distributed as dist
+from datetime import timedelta
+import datetime, torch.distributed as dist
+from sentence_transformers import SentenceTransformer
+# dist.init_process_group("nccl",timeout=datetime.timedelta(minutes=60))
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingBasedRetriever:
+    """Retrieves most similar demonstrations using sentence embeddings of question + two response pairs."""
+
+    def __init__(self, persona_data, embed_model="all-MiniLM-L6-v2"):
+        """Initialize retriever with pre-computed demonstration embeddings.
+
+        Args:
+            persona_data: List of persona dataset samples in converted format
+            embed_model: Sentence transformer model name (default: all-MiniLM-L6-v2, 80MB)
+        """
+        self.embed_model_name = embed_model
+        logger.info(f"Loading embedding model: {embed_model}")
+        self.embedder = SentenceTransformer(embed_model)
+
+        self.persona_data = persona_data
+
+        # Extract demonstration texts (question + both responses in prompt format, no label)
+        # We'll create embeddings that capture the full comparison context
+        self.demo_texts = []
+        self.demo_metadata = []
+
+        for idx, sample in enumerate(persona_data):
+            question = sample['prompt'].strip()
+            responses = sample['all_generated_responses']
+
+            if len(responses) < 2:
+                continue
+
+            # For persona dataset: responses[0] = yw (winner), responses[1] = yl (loser)
+            chosen = responses[0].strip()
+            rejected = responses[1].strip()
+
+            # Create text in prompt format (question + two responses, no label)
+            # This matches the structure of test queries
+            text = self._create_demo_text(question, chosen, rejected)
+            self.demo_texts.append(text)
+            self.demo_metadata.append({
+                'sample_idx': idx,
+                'question': question,
+                'response_a': chosen,
+                'response_b': rejected
+            })
+
+        # Pre-compute embeddings for all demonstration texts
+        logger.info(f"Pre-computing embeddings for {len(self.demo_texts)} demonstration prompts...")
+        self.demo_embeddings = self.embedder.encode(
+            self.demo_texts,
+            convert_to_numpy=True,
+            show_progress_bar=False
+        )
+        logger.info(f"Embeddings computed. Shape: {self.demo_embeddings.shape}")
+
+    def _create_demo_text(self, question, response_a, response_b):
+        """Create demonstration text in prompt format (question + two responses, no label)."""
+        text = f"## Question\n{question}\n\n"
+        text += f"[The Start of Assistant A's Answer]\n{response_a}\n"
+        text += f"[The End of Assistant A's Answer]\n\n"
+        text += f"[The Start of Assistant B's Answer]\n{response_b}\n"
+        text += f"[The End of Assistant B's Answer]"
+        return text
+
+    def retrieve_top_k_indices(self, query_question, query_responses, k=4, query_random_seed=None):
+        """Retrieve indices of top-k most similar demonstration samples.
+
+        Args:
+            query_question: The test query question text
+            query_responses: List of responses for the query
+            k: Number of demonstration samples to retrieve (not pairs)
+            query_random_seed: Random seed for shuffling query response order (optional)
+
+        Returns:
+            List of k sample indices most similar to the query (excluding exact matches)
+        """
+        # Randomly shuffle response order to avoid position bias in similarity matching
+        if query_random_seed is not None:
+            local_rng = random.Random(query_random_seed)
+            shuffled_responses = query_responses.copy()
+            local_rng.shuffle(shuffled_responses)
+            response_a, response_b = shuffled_responses[0].strip(), shuffled_responses[1].strip()
+        else:
+            response_a, response_b = query_responses[0].strip(), query_responses[1].strip()
+
+        # Create query text in same format as demonstrations (question + two responses, no label)
+        query_text = self._create_demo_text(query_question, response_a, response_b)
+
+        # Encode query
+        query_embedding = self.embedder.encode([query_text], convert_to_numpy=True, show_progress_bar=False)[0]
+
+        # Compute cosine similarities
+        similarities = np.dot(self.demo_embeddings, query_embedding) / (
+            np.linalg.norm(self.demo_embeddings, axis=1) * np.linalg.norm(query_embedding)
+        )
+
+        # Exclude exact matches and same-sample matches
+        epsilon = 1e-6
+        filtered_similarities = similarities.copy()
+
+        for idx, metadata in enumerate(self.demo_metadata):
+            # Check for exact match (similarity ~= 1.0)
+            if np.abs(similarities[idx] - 1.0) < epsilon:
+                filtered_similarities[idx] = -np.inf
+            # Also check if the question is exactly the same (to avoid retrieving same sample)
+            elif metadata['question'].strip() == query_question.strip():
+                filtered_similarities[idx] = -np.inf
+
+        # Sort by similarity and get top-k sample indices directly
+        # (No need to group since we only have one embedding per sample now)
+        sorted_samples = sorted(enumerate(filtered_similarities), key=lambda x: x[1], reverse=True)
+        top_k_sample_indices = [self.demo_metadata[idx]['sample_idx'] for idx, sim in sorted_samples[:k] if sim > -np.inf]
+
+        # If we don't have enough samples, log a warning
+        if len(top_k_sample_indices) < k:
+            logger.warning(f"Only found {len(top_k_sample_indices)} valid samples for retrieval (requested {k})")
+
+        return top_k_sample_indices
+
+class PairwiseComparisonDataset(Dataset):
+    """Custom dataset for handling pairwise comparisons with retrieval-based demonstration selection."""
+
+    def __init__(self, dataset, tokenizer, max_length=None, query_random_seed=None,
+                 retriever=None, persona_data=None, k_shot=4):
+        """
+        Args:
+            dataset: The dataset containing test queries
+            tokenizer: Tokenizer for the model
+            max_length: Maximum sequence length
+            query_random_seed: Seed for per-query randomization
+            retriever: EmbeddingBasedRetriever instance (required)
+            persona_data: Full persona data (for loading examples)
+            k_shot: Number of demonstrations to retrieve
+        """
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.query_random_seed = query_random_seed
+        self.retriever = retriever
+        self.persona_data = persona_data
+        self.k_shot = k_shot
+        self.comparison_data = []
+
+        # Pre-generate all comparison pairs for all samples
+        self._prepare_comparisons()
+
+    def _prepare_comparisons(self):
+        """Pre-generate all comparison pairs across all samples."""
+        for sample_idx, sample in enumerate(self.dataset):
+            prompt = sample["prompt"].strip()
+            all_responses = [r.strip() for r in sample["all_generated_responses"]]
+
+            # Check we have at least 2 responses
+            if len(all_responses) < 2:
+                logger.warning(f"Sample {sample_idx} has {len(all_responses)} responses, need at least 2. Skipping.")
+                continue
+
+            # Generate all pairwise comparisons for this sample
+            for i in range(len(all_responses)):
+                for j in range(len(all_responses)):
+                    if i == j:
+                        continue  # Skip diagonal elements
+
+                    # Store metadata - prompt will be created on-the-fly in __getitem__
+                    self.comparison_data.append({
+                        'sample_idx': sample_idx,
+                        'response_i': i,
+                        'response_j': j,
+                        'response_a': all_responses[i],
+                        'response_b': all_responses[j],
+                        'original_prompt': prompt,
+                        'all_responses': all_responses,
+                        # 'original_rm_scores': sample.get("all_rm_scores", None)
+                    })
+
+    def _create_prompt_template(self, question, response_a, response_b, few_shot_examples=None):
+        """Create a prompt template for pairwise comparison with few-shot examples.
+
+        Following the approach from preference_datasets.py: no system prompt, no chat template,
+        examples and test query in one string.
+
+        Args:
+            question: The test query question
+            response_a: First response to compare
+            response_b: Second response to compare
+            few_shot_examples: List of few-shot examples to use (already shuffled)
+        """
+
+        # Build the prompt as a single string with few-shot examples
+        prompt_text = ""
+
+        # Add few-shot examples (already shuffled to avoid ordering bias)
+        if few_shot_examples:
+            for i, example in enumerate(few_shot_examples):
+                prompt_text += f"# Example {i + 1}\n"
+                prompt_text += f"## Question\n{example['question']}\n\n"
+                prompt_text += f"[The Start of Assistant A's Answer]\n{example['response_a']}\n"
+                prompt_text += f"[The End of Assistant A's Answer]\n\n"
+                prompt_text += f"[The Start of Assistant B's Answer]\n{example['response_b']}\n"
+                prompt_text += f"[The End of Assistant B's Answer]\n\n"
+                prompt_text += f"## Preferred answer: [[{example['label']}]]\n\n"
+
+        # Add task header with brief instruction
+        prompt_text += "# Task\n"
+        if few_shot_examples:
+            prompt_text += "Given the examples above, evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy.\n\n"
+        else:
+            prompt_text += "Evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy.\n\n"
+        # prompt_text += 'Output your verdict as "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.\n\n'
+
+        # Add the current query
+        prompt_text += f"## Question\n{question}\n\n"
+        prompt_text += f"[The Start of Assistant A's Answer]\n{response_a}\n"
+        prompt_text += f"[The End of Assistant A's Answer]\n\n"
+        prompt_text += f"[The Start of Assistant B's Answer]\n{response_b}\n"
+        prompt_text += f"[The End of Assistant B's Answer]\n\n"
+        prompt_text += "## Preferred answer: [["
+        return prompt_text
+
+    def __len__(self):
+        return len(self.comparison_data)
+
+    def __getitem__(self, idx):
+        item = self.comparison_data[idx]
+
+        # Retrieve top-k most similar demonstrations for this query
+        # Pass query_random_seed for response shuffling in similarity computation
+        top_k_indices = self.retriever.retrieve_top_k_indices(
+            item['original_prompt'],
+            item['all_responses'],
+            k=self.k_shot,
+            query_random_seed=self.query_random_seed + item['sample_idx']
+        )
+
+        # Load the few-shot examples for these indices
+        # This will create BOTH orderings (A/B and B/A) for each retrieved sample
+        few_shot_examples = load_few_shot_examples_from_persona_data(
+            persona_data=self.persona_data,
+            indices=top_k_indices
+        )
+
+        # Shuffle the retrieved demonstrations to avoid ordering bias
+        # Use query-specific seed for reproducibility
+        local_rng = random.Random(self.query_random_seed + item['sample_idx'])
+        local_rng.shuffle(few_shot_examples)
+
+        # ========== DEBUG: Check if retrieval and shuffling are the same for reversed pairs ==========
+        # Test for sample_idx=0: compare (i=0,j=1) vs (i=1,j=0)
+        # if item['sample_idx'] == 0:
+        #     print(f"\n{'='*80}")
+        #     print(f"DEBUG: sample_idx={item['sample_idx']}, response_i={item['response_i']}, response_j={item['response_j']}")
+        #     print(f"Random seed used: {self.query_random_seed + item['sample_idx']}")
+        #     print(f"Retrieved indices: {top_k_indices}")
+        #     print(f"Number of demos after loading (should be 2*k): {len(few_shot_examples)}")
+        #     print(f"Demo order after shuffling (first 3 questions):")
+        #     for i, demo in enumerate(few_shot_examples[:3]):
+        #         question_preview = demo['question'][:80] + "..." if len(demo['question']) > 80 else demo['question']
+        #         print(f"  Demo {i}: label={demo['label']}, question={question_preview}")
+
+        #     # Store for comparison between reversed pairs
+        #     comparison_key = f"{item['response_i']}_{item['response_j']}"
+        #     if not hasattr(self, '_debug_store'):
+        #         self._debug_store = {}
+
+        #     self._debug_store[comparison_key] = {
+        #         'indices': top_k_indices.copy(),
+        #         'demo_labels': [d['label'] for d in few_shot_examples],
+        #         'demo_questions_preview': [d['question'][:50] for d in few_shot_examples]
+        #     }
+
+        #     # If we have both orderings (0_1 and 1_0), compare them
+        #     if '0_1' in self._debug_store and '1_0' in self._debug_store:
+        #         print(f"\n{'*'*80}")
+        #         print(f"COMPARISON: Checking if (i=0,j=1) and (i=1,j=0) have same retrieval/order")
+        #         print(f"{'*'*80}")
+        #         indices_match = self._debug_store['0_1']['indices'] == self._debug_store['1_0']['indices']
+        #         labels_match = self._debug_store['0_1']['demo_labels'] == self._debug_store['1_0']['demo_labels']
+        #         questions_match = self._debug_store['0_1']['demo_questions_preview'] == self._debug_store['1_0']['demo_questions_preview']
+
+        #         print(f"Retrieved indices match: {indices_match}")
+        #         if not indices_match:
+        #             print(f"  (0,1): {self._debug_store['0_1']['indices']}")
+        #             print(f"  (1,0): {self._debug_store['1_0']['indices']}")
+
+        #         print(f"Demo labels match: {labels_match}")
+        #         if not labels_match:
+        #             print(f"  (0,1): {self._debug_store['0_1']['demo_labels']}")
+        #             print(f"  (1,0): {self._debug_store['1_0']['demo_labels']}")
+
+        #         print(f"Demo questions match: {questions_match}")
+        #         if not questions_match:
+        #             print(f"  (0,1): {self._debug_store['0_1']['demo_questions_preview'][:3]}")
+        #             print(f"  (1,0): {self._debug_store['1_0']['demo_questions_preview'][:3]}")
+
+        #         all_match = indices_match and labels_match and questions_match
+        #         print(f"\n>>> RESULT: All match = {all_match} (expected: True)")
+        #         print(f"{'*'*80}\n")
+
+        #     print(f"{'='*80}\n")
+
+        #     # BREAKPOINT: Set breakpoint here to inspect values
+        #     # You can use: import pdb; pdb.set_trace()
+        #     # Or set IDE breakpoint on the line below
+        #     breakpoint()  # <-- SET BREAKPOINT HERE
+        # # ========== END DEBUG ==========
+
+        # Create prompt with shuffled demonstrations
+        prompt_text = self._create_prompt_template(
+            item['original_prompt'],
+            item['response_a'],
+            item['response_b'],
+            few_shot_examples
+        )
+
+        return {
+            'prompt_text': prompt_text,
+            'sample_idx': item['sample_idx'],
+            'response_i': item['response_i'],
+            'response_j': item['response_j'],
+            'response_a': item['response_a'],
+            'response_b': item['response_b'],
+            'original_prompt': item['original_prompt'],
+            'all_responses': item['all_responses'],
+            # 'original_rm_scores': item['original_rm_scores']
+        }
+
+def make_collate_fn(tokenizer, max_length=None):
+    """Create a collate function that uses tokenizer's built-in left padding and precomputed kwargs."""
+    # Precompute tokenizer arguments once
+    tokenize_kwargs = {
+        'return_tensors': "pt",
+        'padding': True,  # Dynamic padding to longest in batch
+    }
+    if max_length is not None:
+        tokenize_kwargs.update({
+            'truncation': True,
+            'max_length': max_length
+        })
+
+    def _collate_fn(batch):
+        # Extract prompts for tokenizer padding
+        prompts = [item['prompt_text'] for item in batch]
+
+        # Use tokenizer's built-in padding (respects padding_side="left")
+        tokenized = tokenizer(prompts, **tokenize_kwargs)
+
+        return {
+            'input_ids': tokenized['input_ids'],
+            'attention_mask': tokenized['attention_mask'],
+            'metadata': [{
+                k: v for k, v in item.items()
+                if k not in ['prompt_text']
+            } for item in batch]
+        }
+
+    return _collate_fn
+
+
+def load_few_shot_examples_from_persona_data(persona_data, indices):
+    """Load few-shot examples from persona dataset.
+
+    For persona dataset, yw is the winning/preferred response and yl is the losing response.
+    Creates BOTH orderings (A/B and B/A) for each sample to ensure balanced labels in context.
+
+    Args:
+        persona_data: List of persona dataset samples (converted format)
+        indices: List of sample indices to use for few-shot examples
+
+    Returns:
+        List of few-shot examples (2x len(indices) due to both orderings)
+    """
+    try:
+        logger.info(f"Loading few-shot examples from persona data")
+        examples = []
+
+        for idx in indices:
+            if idx >= len(persona_data):
+                logger.warning(f"Index {idx} is out of range for persona_data (size: {len(persona_data)})")
+                continue
+
+            sample = persona_data[idx]
+            question = sample['prompt'].strip()
+            responses = sample['all_generated_responses']
+
+            if len(responses) < 2:
+                logger.warning(f"Sample {idx} has fewer than 2 responses")
+                continue
+
+            # For persona dataset: responses[0] = yw (winner), responses[1] = yl (loser)
+            chosen = responses[0].strip()
+            rejected = responses[1].strip()
+
+            # Create first example: A=chosen, B=rejected (label=A)
+            examples.append({
+                'question': question,
+                'response_a': chosen,
+                'response_b': rejected,
+                'label': 'A'
+            })
+
+            # Create second example: A=rejected, B=chosen (label=B)
+            examples.append({
+                'question': question,
+                'response_a': rejected,
+                'response_b': chosen,
+                'label': 'B'
+            })
+
+        logger.info(f"Loaded {len(examples)} few-shot examples from persona data")
+        return examples
+
+    except Exception as e:
+        logger.warning(f"Failed to load few-shot examples from persona data: {e}")
+        return []
+
+
+def filter_dataset_by_persona(dataset, persona_id=None):
+    """Filter dataset to only include samples from a specific persona.
+
+    Args:
+        dataset: HuggingFace dataset
+        persona_id: Specific persona UUID to filter for. If None, uses first persona.
+
+    Returns:
+        Filtered dataset and the persona_id used
+    """
+    # Get all unique persona IDs
+    if 'persona_uuid' in dataset.column_names:
+        persona_col = 'persona_uuid'
+    elif 'score_persona' in dataset.column_names:
+        # Extract persona_uuid from score_persona dict
+        persona_ids = [sample['score_persona'].get('persona_uuid') if isinstance(sample.get('score_persona'), dict) else None
+                      for sample in dataset]
+        # If we need to filter by persona_uuid from nested dict
+        if persona_id is None:
+            # Get first non-None persona
+            persona_id = next((pid for pid in persona_ids if pid is not None), None)
+
+        logger.info(f"Filtering for persona: {persona_id}")
+        filtered_indices = [i for i, pid in enumerate(persona_ids) if pid == persona_id]
+        filtered_dataset = dataset.select(filtered_indices)
+        logger.info(f"Filtered dataset size: {len(filtered_dataset)} samples for persona {persona_id}")
+        return filtered_dataset, persona_id
+    else:
+        logger.warning("No persona_uuid column found, returning original dataset")
+        return dataset, None
+
+def prepare_persona_dataset_as_pairwise(dataset):
+    """Convert persona dataset format to expected pairwise comparison format.
+
+    The persona dataset has 'question', 'yw', 'yl' fields.
+    We'll create a format compatible with the existing code by treating yw and yl as two responses.
+
+    Args:
+        dataset: Filtered persona dataset
+
+    Returns:
+        List of dicts with 'prompt' and 'all_generated_responses' keys
+    """
+    converted_data = []
+    for sample in dataset:
+        # Extract question
+        prompt = sample['x']
+
+        # Get the two responses (winner and loser)
+        yw = sample.get('yw', '').strip()
+        yl = sample.get('yl', '').strip()
+
+        # Create pairwise comparison format with 2 responses
+        # We'll duplicate to create 5 responses as expected by original code,
+        # or modify to work with just 2
+        converted_data.append({
+            'prompt': prompt,
+            'all_generated_responses': [yw, yl],  # Just two responses
+            'all_rm_scores': None  # No RM scores for this dataset
+        })
+
+    return converted_data
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate pairwise preference comparisons with retrieval-based few-shot demonstrations")
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
+                       help="Model to use for preference evaluation")
+    parser.add_argument("--dataset_name", type=str, default="sher222/persona-iterative-responses",
+                       help="Dataset name from HuggingFace")
+    parser.add_argument("--split", type=str, default="train",
+                       help="Split of the dataset to process")
+    parser.add_argument("--persona_id", type=str, default=None,
+                       help="Specific persona UUID to filter for. If None, uses first persona found (used if --persona_ids not provided).")
+    parser.add_argument("--persona_ids", type=str, nargs='+', default=None,
+                       help="Multiple persona UUIDs to run experiments for (e.g., --persona_ids uuid1 uuid2 uuid3)")
+    parser.add_argument("--batch_size", type=int, default=1,
+                       help="Batch size per device for processing comparisons")
+    parser.add_argument("--max_samples", type=int, default=512,
+                       help="Maximum number of samples to process (for testing)")
+    parser.add_argument("--use_compilation", action="store_true", default=False,
+                       help="Whether to use torch compilation for speedup")
+    parser.add_argument("--use_flash_attention", action="store_true", default=True,
+                       help="Whether to use Flash Attention 2 if available")
+    parser.add_argument("--max_length", type=int, default=None,
+                       help="Maximum sequence length for tokenization (None for no truncation)")
+    parser.add_argument("--k_shot", type=int, default=4,
+                       help="Number of few-shot examples to retrieve from persona data as demonstrations (used if --k_shots not provided)")
+    parser.add_argument("--k_shots", type=int, nargs='+', default=None,
+                       help="Multiple k-shot values to run experiments for (e.g., --k_shots 2 4 8)")
+    parser.add_argument("--seed", type=int, default=42,
+                       help="Random seed for per-query response shuffling in similarity computation (used if --seeds not provided)")
+    parser.add_argument("--seeds", type=int, nargs='+', default=None,
+                       help="Multiple random seeds to run experiments for (e.g., --seeds 42 123 456)")
+    parser.add_argument("--output_dir", type=str, default="./persona_results",
+                       help="Directory to save results")
+    parser.add_argument("--embedding_model", type=str, default="all-MiniLM-L6-v2",
+                       help="Sentence transformer model for embedding-based retrieval")
+    return parser.parse_args()
+
+def get_preference_probabilities_batch_accelerate(model, batch, token_a_id, token_b_id, accelerator):
+    """
+    Compute preference probabilities for a batch using Accelerate.
+    """
+    input_ids = batch['input_ids']
+    attention_mask = batch['attention_mask']
+
+    with torch.no_grad(), torch.autocast(device_type='cuda' if accelerator.device.type == 'cuda' else 'cpu', dtype=torch.bfloat16):
+        # Get model outputs for the batch
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
+
+        # Get the logits for the last token position for each sequence
+        batch_size = logits.shape[0]
+
+        results = []
+        for i in range(batch_size):
+            last_token_logits = logits[i, -1, :]  # Shape: (vocab_size,)
+
+            # Get logits for tokens "A" and "B"
+            logit_a = last_token_logits[token_a_id].item()
+            logit_b = last_token_logits[token_b_id].item()
+
+            # Compute probability using softmax
+            logits_ab = torch.tensor([logit_a, logit_b])
+            probs_ab = F.softmax(logits_ab, dim=0)
+            prob_a_over_b = probs_ab[0].item()  # Probability of A
+
+            results.append((prob_a_over_b, logit_a, logit_b))
+
+    return results
+
+def reconstruct_preference_matrices(all_comparison_results):
+    """
+    Reconstruct preference matrices from distributed comparison results.
+
+    Returns:
+        final_results: List of results with preference matrices
+        accuracy_metrics: Dict with accuracy statistics
+    """
+    # Group results by sample_idx
+    sample_results = {}
+    for result in all_comparison_results:
+        sample_idx = result['sample_idx']
+        if sample_idx not in sample_results:
+            sample_results[sample_idx] = {
+                'comparisons': {},
+                'metadata': {
+                    'original_prompt': result['original_prompt'],
+                    'all_responses': result['all_responses'],
+                    # 'original_rm_scores': result['original_rm_scores']
+                }
+            }
+
+        key = f"{result['response_i']}_vs_{result['response_j']}"
+        sample_results[sample_idx]['comparisons'][key] = {
+            'response_a': result['response_a'],
+            'response_b': result['response_b'],
+            'prob_a_over_b': result['prob_a_over_b'],
+            'logit_a': result['logit_a'],
+            'logit_b': result['logit_b'],
+        }
+
+    # Convert to final format with preference matrices and calculate accuracy
+    final_results = []
+    correct_predictions = 0
+    total_predictions = 0
+
+    for sample_idx in sorted(sample_results.keys()):
+        sample_data = sample_results[sample_idx]
+        metadata = sample_data['metadata']
+        comparisons = sample_data['comparisons']
+
+        # Reconstruct preference matrix
+        n_responses = len(metadata['all_responses'])
+        preference_matrix = np.full((n_responses, n_responses), np.nan)
+
+        for key, comparison in comparisons.items():
+            i, j = map(int, key.split('_vs_'))
+            preference_matrix[i, j] = comparison['prob_a_over_b']
+
+        # Calculate accuracy for this sample
+        # For persona dataset: responses[0] = yw (winner), responses[1] = yl (loser)
+        # Ground truth: response 0 should be preferred over response 1
+        # Check if preference_matrix[0, 1] > 0.5 (model prefers response 0 over 1)
+        is_correct = False
+        if n_responses >= 2:
+            prob_0_over_1 = preference_matrix[0, 1]
+            if not np.isnan(prob_0_over_1):
+                is_correct = prob_0_over_1 > 0.5
+                correct_predictions += int(is_correct)
+                total_predictions += 1
+
+        # Convert NaN values to None for JSON serialization
+        preference_matrix_list = preference_matrix.tolist()
+        preference_matrix_serializable = [
+            [None if (isinstance(val, float) and np.isnan(val)) else val for val in row]
+            for row in preference_matrix_list
+        ]
+
+        result = {
+            "sample_id": sample_idx,
+            "prompt": metadata['original_prompt'],
+            "responses": metadata['all_responses'],
+            "preference_matrix": preference_matrix_serializable,
+            "detailed_comparisons": comparisons,
+            # "original_rm_scores": metadata['original_rm_scores'],
+            "is_correct": bool(is_correct),
+            "predicted_winner_prob": float(preference_matrix[0, 1]) if not np.isnan(preference_matrix[0, 1]) else None
+        }
+
+        final_results.append(result)
+
+    # Calculate accuracy metrics
+    accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+    accuracy_metrics = {
+        "accuracy": accuracy,
+        "correct_predictions": correct_predictions,
+        "total_predictions": total_predictions
+    }
+
+    return final_results, accuracy_metrics
+
+def run_experiment_for_seed(seed, k_shot, args, accelerator, model, tokenizer, token_a_id, token_b_id, persona_data, persona_id=None):
+    """Run the preference comparison experiment for a single seed and k_shot combination.
+
+    Args:
+        seed: Random seed for the experiment
+        k_shot: Number of few-shot examples to use
+        args: Command-line arguments
+        accelerator: Accelerator instance
+        model: The model for inference
+        tokenizer: Tokenizer
+        token_a_id: Token ID for "A"
+        token_b_id: Token ID for "B"
+        persona_data: List of persona dataset samples in converted format
+        persona_id: The persona UUID being used
+    """
+
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Running experiment with seed: {seed}, k_shot: {k_shot}")
+        logger.info(f"Using embedding-based retrieval with k={k_shot}")
+        logger.info(f"{'='*80}")
+
+    # Total available samples for this persona
+    total_samples = len(persona_data)
+
+    # First, deterministically select test set (independent of seed/k_shot)
+    # This ensures the same test examples are used across all experiments
+    if args.max_samples and args.max_samples < total_samples:
+        test_indices = list(range(args.max_samples))
+    else:
+        test_indices = list(range(total_samples))
+
+    if accelerator.is_main_process:
+        logger.info(f"Test set indices: first {len(test_indices)} samples (0-{len(test_indices)-1})")
+
+    # Create holdout set: all samples NOT in test set (for demonstrations)
+    holdout_indices = [i for i in range(total_samples) if i not in test_indices]
+
+    if accelerator.is_main_process:
+        logger.info(f"Holdout set size: {len(holdout_indices)} samples (for demonstration retrieval)")
+
+    # Check we have enough holdout samples for k-shot
+    if len(holdout_indices) < k_shot:
+        raise ValueError(f"Not enough holdout samples ({len(holdout_indices)}) to retrieve {k_shot} demonstrations. "
+                        f"Reduce max_samples or k_shot.")
+
+    # Create holdout data for retrieval (samples NOT in test set)
+    holdout_data = [persona_data[i] for i in holdout_indices]
+
+    # Initialize retriever with ONLY holdout data (not test samples)
+    if accelerator.is_main_process:
+        logger.info(f"Initializing retriever with {len(holdout_data)} holdout samples...")
+    retriever = EmbeddingBasedRetriever(
+        persona_data=holdout_data,
+        embed_model=args.embedding_model
+    )
+    if accelerator.is_main_process:
+        logger.info("Retriever initialized successfully")
+
+    test_data = [persona_data[i] for i in test_indices]
+
+    if accelerator.is_main_process:
+        logger.info(f"Test set size: {len(test_data)} samples")
+
+    # Create custom dataset with retrieval support
+    comparison_dataset = PairwiseComparisonDataset(
+        test_data,  # Use test_data instead of full dataset
+        tokenizer,
+        args.max_length,
+        query_random_seed=seed,
+        retriever=retriever,
+        persona_data=holdout_data,  # Only holdout data for retrieval (not test samples)
+        k_shot=k_shot
+    )
+
+    # Create collate function with tokenizer and max_length
+    collate = make_collate_fn(tokenizer, args.max_length)
+
+    dataloader = DataLoader(
+        comparison_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate,
+        num_workers=0
+    )
+
+    # Prepare dataloader with accelerator
+    dataloader = accelerator.prepare(dataloader)
+
+    if accelerator.is_main_process:
+        logger.info(f"Total comparisons: {len(comparison_dataset)}")
+        logger.info(f"Batches per process: {len(dataloader)}")
+
+    # Process batches
+    all_results = []
+    start_time = time.time()
+
+    with accelerator.main_process_first():
+        progress_bar = tqdm.tqdm(
+            dataloader,
+            desc=f"Seed {seed} - Processing comparisons",
+            disable=not accelerator.is_main_process
+        )
+
+    for batch_idx, batch in enumerate(progress_bar):
+        try:
+            # Get preference probabilities for the batch
+            batch_results = get_preference_probabilities_batch_accelerate(
+                model, batch, token_a_id, token_b_id, accelerator
+            )
+
+            # Combine with metadata
+            for i, (prob_a_over_b, logit_a, logit_b) in enumerate(batch_results):
+                metadata = batch['metadata'][i]
+                result = {
+                    'sample_idx': metadata['sample_idx'],
+                    'response_i': metadata['response_i'],
+                    'response_j': metadata['response_j'],
+                    'response_a': metadata['response_a'],
+                    'response_b': metadata['response_b'],
+                    'original_prompt': metadata['original_prompt'],
+                    'all_responses': metadata['all_responses'],
+                    # 'original_rm_scores': metadata['original_rm_scores'],
+                    'prob_a_over_b': prob_a_over_b,
+                    'logit_a': logit_a,
+                    'logit_b': logit_b
+                }
+                all_results.append(result)
+
+            # Log progress periodically
+            if accelerator.is_main_process and (batch_idx + 1) % 100 == 0:
+                elapsed = time.time() - start_time
+                avg_time = elapsed / (batch_idx + 1)
+                eta = avg_time * (len(dataloader) - batch_idx - 1) / 60
+                logger.info(f"Processed {batch_idx + 1}/{len(dataloader)} batches | "
+                          f"Avg: {avg_time:.2f}s/batch | ETA: {eta:.1f}min")
+
+        except Exception as e:
+            if accelerator.is_main_process:
+                logger.error(f"Error processing batch {batch_idx}: {str(e)}")
+            continue
+
+    # Save intermediate results per rank
+    rank = accelerator.process_index
+    # Include persona_id in filename to avoid overwriting results from different personas
+    persona_str = persona_id if persona_id else "unknown"
+    part_file = f"{args.output_dir}/seed_{seed}_rank_{rank}_k{k_shot}_persona_{persona_str}_retrieval.jsonl"
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    with open(part_file, "w") as f:
+        for item in all_results:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+    accelerator.wait_for_everyone()
+
+    # Only main process handles final processing and saving
+    if accelerator.is_main_process:
+        # Gather results from all ranks
+        gathered_results = []
+        for r in range(accelerator.num_processes):
+            rank_file = f"{args.output_dir}/seed_{seed}_rank_{r}_k{k_shot}_persona_{persona_str}_retrieval.jsonl"
+            with open(rank_file) as f:
+                for line in f:
+                    gathered_results.append(json.loads(line))
+
+        logger.info(f"Gathered {len(gathered_results)} comparison results for seed {seed}, k_shot {k_shot}")
+
+        # Reconstruct preference matrices and calculate accuracy
+        final_results, accuracy_metrics = reconstruct_preference_matrices(gathered_results)
+
+        # Log accuracy metrics
+        logger.info(f"\n{'='*80}")
+        logger.info(f"ACCURACY METRICS")
+        logger.info(f"{'='*80}")
+        logger.info(f"Accuracy: {accuracy_metrics['accuracy']:.4f} ({accuracy_metrics['accuracy']*100:.2f}%)")
+        logger.info(f"Correct predictions: {accuracy_metrics['correct_predictions']}/{accuracy_metrics['total_predictions']}")
+        logger.info(f"{'='*80}\n")
+
+        # Save final results for this seed and k_shot
+        output_file = f"{args.output_dir}/pairwise_preferences_seed_{seed}_k{k_shot}_persona_{persona_str}_retrieval.json"
+        logger.info(f"Saving results to {output_file}")
+        with open(output_file, 'w') as f:
+            json.dump(final_results, f, indent=2)
+
+        # Also save metadata about the experiment
+        metadata_file = f"{args.output_dir}/metadata_seed_{seed}_k{k_shot}_persona_{persona_str}_retrieval.json"
+        metadata = {
+            "seed": seed,
+            "k_shot": k_shot,
+            "retrieval_mode": "similarity",
+            "embedding_model": args.embedding_model,
+            "num_test_samples": len(final_results),
+            "total_persona_samples": total_samples,
+            "persona_id": persona_id,
+            "model_name": args.model_name,
+            "dataset_name": args.dataset_name,
+            "split": args.split,
+            "accuracy_metrics": accuracy_metrics
+        }
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"Seed {seed}, k_shot {k_shot} complete. Processed {len(final_results)} samples with {accuracy_metrics['accuracy']*100:.2f}% accuracy")
+
+        total_time = time.time() - start_time
+        logger.info(f"Time for seed {seed}, k_shot {k_shot}: {total_time / 60:.1f} minutes")
+
+    accelerator.wait_for_everyone()
+
+def main():
+    # Initialize accelerator with DDP settings
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+
+    args = parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Only log on main process
+    if accelerator.is_main_process:
+        logger.info(f"{'='*80}")
+        logger.info(f"Persona-Based In-Context Learning Experiment")
+        logger.info(f"{'='*80}")
+        logger.info(f"Model: {args.model_name}")
+        logger.info(f"Dataset: {args.dataset_name}")
+        logger.info(f"Split: {args.split}")
+        logger.info(f"Retrieval mode: embedding-based (similarity)")
+        logger.info(f"Embedding model: {args.embedding_model}")
+        logger.info(f"Max test samples: {args.max_samples}")
+        logger.info(f"Number of processes: {accelerator.num_processes}")
+        logger.info(f"Device: {accelerator.device}")
+        logger.info(f"Output directory: {args.output_dir}")
+
+    # Load model and tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+
+    # Set pad token if not set and configure for left padding
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer.padding_side = "left"
+
+    # Determine attention implementation
+    attn_impl = None
+    if args.use_flash_attention and torch.cuda.is_available():
+        try:
+            attn_impl = "flash_attention_2"
+            if accelerator.is_main_process:
+                logger.info("Using Flash Attention 2")
+        except:
+            if accelerator.is_main_process:
+                logger.warning("Flash Attention 2 not available, using default attention")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=attn_impl,
+    )
+
+    model.eval()
+
+    # Pre-compute token IDs for "A" and "B"
+    token_a_id = tokenizer.encode("A", add_special_tokens=False)[0]
+    token_b_id = tokenizer.encode("B", add_special_tokens=False)[0]
+    if accelerator.is_main_process:
+        logger.info(f"Token A ID: {token_a_id}, Token B ID: {token_b_id}")
+
+    # Enable torch compilation
+    if args.use_compilation:
+        try:
+            model = torch.compile(model, mode="max-autotune", fullgraph=False)
+            if accelerator.is_main_process:
+                logger.info("Model compiled successfully with max-autotune")
+        except Exception as e:
+            if accelerator.is_main_process:
+                logger.warning(f"Model compilation failed: {e}")
+
+    # Prepare model with accelerator
+    model = accelerator.prepare(model)
+
+    # Load dataset
+    if accelerator.is_main_process:
+        logger.info(f"Loading dataset: {args.dataset_name}")
+
+    dataset = load_dataset(args.dataset_name, split=args.split)
+
+    # Determine which persona_ids to use
+    if args.persona_ids is not None:
+        persona_ids_to_run = args.persona_ids
+        if accelerator.is_main_process:
+            logger.info(f"Running experiments for multiple personas: {persona_ids_to_run}")
+    else:
+        # Use single persona_id or auto-detect
+        persona_ids_to_run = [args.persona_id]  # Can be [None] for auto-detection
+        if accelerator.is_main_process:
+            if args.persona_id:
+                logger.info(f"Running experiment for single persona: {args.persona_id}")
+            else:
+                logger.info(f"Running experiment for auto-detected persona")
+
+    # Determine which k_shot values to use
+    if args.k_shots is not None:
+        k_shots_to_run = args.k_shots
+        if accelerator.is_main_process:
+            logger.info(f"Running experiments for multiple k_shot values: {k_shots_to_run}")
+    else:
+        k_shots_to_run = [args.k_shot]
+        if accelerator.is_main_process:
+            logger.info(f"Running experiment for single k_shot: {args.k_shot}")
+
+    # Determine which seeds to use
+    if args.seeds is not None:
+        seeds_to_run = args.seeds
+        if accelerator.is_main_process:
+            logger.info(f"Running experiments for multiple seeds: {seeds_to_run}")
+    else:
+        seeds_to_run = [args.seed]
+        if accelerator.is_main_process:
+            logger.info(f"Running experiment for single seed: {args.seed}")
+
+    # Calculate total number of experiments
+    total_experiments = len(persona_ids_to_run) * len(k_shots_to_run) * len(seeds_to_run)
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"GRID SEARCH CONFIGURATION")
+        logger.info(f"{'='*80}")
+        logger.info(f"Personas: {len(persona_ids_to_run)}")
+        logger.info(f"K-shot values: {len(k_shots_to_run)}")
+        logger.info(f"Seeds: {len(seeds_to_run)}")
+        logger.info(f"Total experiments: {total_experiments}")
+        logger.info(f"{'='*80}\n")
+
+    # Grid search loop
+    experiment_count = 0
+    for persona_id_to_filter in persona_ids_to_run:
+        # Filter by persona
+        if accelerator.is_main_process:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"Processing persona: {persona_id_to_filter if persona_id_to_filter else 'auto-detect'}")
+            logger.info(f"{'='*80}")
+
+        filtered_dataset, actual_persona_id = filter_dataset_by_persona(dataset, persona_id_to_filter)
+
+        if accelerator.is_main_process:
+            logger.info(f"Using persona: {actual_persona_id}")
+            logger.info(f"Persona-filtered dataset size: {len(filtered_dataset)}")
+
+        # Convert persona dataset to expected format
+        if accelerator.is_main_process:
+            logger.info("Converting persona dataset to pairwise comparison format...")
+
+        persona_data = prepare_persona_dataset_as_pairwise(filtered_dataset)
+        if accelerator.is_main_process:
+            logger.info(f"Converted {len(persona_data)} samples")
+
+        # Run experiments for all k_shot and seed combinations for this persona
+        # Retriever will be initialized per-experiment with holdout data only
+        for k_shot in k_shots_to_run:
+            for seed in seeds_to_run:
+                experiment_count += 1
+                if accelerator.is_main_process:
+                    logger.info(f"\n{'='*80}")
+                    logger.info(f"EXPERIMENT {experiment_count}/{total_experiments}")
+                    logger.info(f"Persona: {actual_persona_id}, K-shot: {k_shot}, Seed: {seed}")
+                    logger.info(f"{'='*80}")
+
+                run_experiment_for_seed(
+                    seed=seed,
+                    k_shot=k_shot,
+                    args=args,
+                    accelerator=accelerator,
+                    model=model,
+                    tokenizer=tokenizer,
+                    token_a_id=token_a_id,
+                    token_b_id=token_b_id,
+                    persona_data=persona_data,
+                    persona_id=actual_persona_id
+                )
+
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"ALL {total_experiments} EXPERIMENTS COMPLETE!")
+        logger.info(f"Results saved to: {args.output_dir}")
+        logger.info(f"{'='*80}")
+
+if __name__ == "__main__":
+    main()
