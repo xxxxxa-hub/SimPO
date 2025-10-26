@@ -242,9 +242,9 @@ class PairwiseComparisonDataset(Dataset):
         # Add task header with brief instruction
         prompt_text += "# Task\n"
         if few_shot_examples:
-            prompt_text += "Given the examples above, evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy.\n\n"
+            prompt_text += "Given the examples above, evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy. "
         else:
-            prompt_text += "Evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy.\n\n"
+            prompt_text += "Evaluate the quality of two AI assistants' responses based on helpfulness, relevance, and accuracy. "
         # prompt_text += 'Output your verdict as "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.\n\n'
 
         # Add the current query
@@ -409,7 +409,7 @@ def load_few_shot_examples_from_persona_data(persona_data, indices):
         List of few-shot examples (2x len(indices) due to both orderings)
     """
     try:
-        logger.info(f"Loading few-shot examples from persona data")
+        # logger.info(f"Loading few-shot examples from persona data")
         examples = []
 
         for idx in indices:
@@ -445,7 +445,7 @@ def load_few_shot_examples_from_persona_data(persona_data, indices):
                 'label': 'B'
             })
 
-        logger.info(f"Loaded {len(examples)} few-shot examples from persona data")
+        # logger.info(f"Loaded {len(examples)} few-shot examples from persona data")
         return examples
 
     except Exception as e:
@@ -585,6 +585,48 @@ def get_preference_probabilities_batch_accelerate(model, batch, token_a_id, toke
 
     return results
 
+def correct_preference_matrix(matrix):
+    """
+    Correct the preference matrix by averaging complementary pairs to remove position bias.
+
+    Raw matrix[i,j] contains P(response_i > response_j | response_i shown as A, response_j shown as B).
+    Corrected P(response_i > response_j) = (matrix[i,j] + (1 - matrix[j,i])) / 2
+
+    This averages two measurements:
+    1. P(i > j | i=A, j=B) = matrix[i,j]
+    2. P(i > j | i=B, j=A) = 1 - P(j > i | j=A, i=B) = 1 - matrix[j,i]
+
+    Args:
+        matrix: Raw preference matrix (numpy array) where matrix[i,j] = P(i > j | i shown as A)
+
+    Returns:
+        corrected_matrix: Matrix with position-bias-corrected preference probabilities
+    """
+    n = matrix.shape[0]
+    corrected = np.full((n, n), np.nan)
+
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                p_i_over_j_when_i_is_A = matrix[i, j]  # P(i > j | i=A, j=B)
+                p_j_over_i_when_j_is_A = matrix[j, i]  # P(j > i | j=A, i=B)
+
+                # Handle missing values
+                if not np.isnan(p_i_over_j_when_i_is_A) and not np.isnan(p_j_over_i_when_j_is_A):
+                    # True P(i > j) = average of both measurements
+                    # = (P(i>j|i=A) + P(i>j|i=B)) / 2
+                    # = (matrix[i,j] + (1 - matrix[j,i])) / 2
+                    true_p_i_over_j = (p_i_over_j_when_i_is_A + (1 - p_j_over_i_when_j_is_A)) / 2
+                    corrected[i, j] = true_p_i_over_j
+                elif not np.isnan(p_i_over_j_when_i_is_A):
+                    # Only one measurement available, use as-is
+                    corrected[i, j] = p_i_over_j_when_i_is_A
+                elif not np.isnan(p_j_over_i_when_j_is_A):
+                    # Use complement of available measurement
+                    corrected[i, j] = 1 - p_j_over_i_when_j_is_A
+
+    return corrected
+
 def reconstruct_preference_matrices(all_comparison_results):
     """
     Reconstruct preference matrices from distributed comparison results.
@@ -626,7 +668,7 @@ def reconstruct_preference_matrices(all_comparison_results):
         metadata = sample_data['metadata']
         comparisons = sample_data['comparisons']
 
-        # Reconstruct preference matrix
+        # Reconstruct raw preference matrix
         n_responses = len(metadata['all_responses'])
         preference_matrix = np.full((n_responses, n_responses), np.nan)
 
@@ -634,34 +676,45 @@ def reconstruct_preference_matrices(all_comparison_results):
             i, j = map(int, key.split('_vs_'))
             preference_matrix[i, j] = comparison['prob_a_over_b']
 
-        # Calculate accuracy for this sample
+        # Correct preference matrix to remove position bias
+        corrected_preference_matrix = correct_preference_matrix(preference_matrix)
+
+        # Calculate accuracy for this sample using CORRECTED matrix
         # For persona dataset: responses[0] = yw (winner), responses[1] = yl (loser)
         # Ground truth: response 0 should be preferred over response 1
-        # Check if preference_matrix[0, 1] > 0.5 (model prefers response 0 over 1)
+        # Check if corrected_preference_matrix[0, 1] > 0.5 (model prefers response 0 over 1)
         is_correct = False
         if n_responses >= 2:
-            prob_0_over_1 = preference_matrix[0, 1]
-            if not np.isnan(prob_0_over_1):
-                is_correct = prob_0_over_1 > 0.5
+            corrected_prob_0_over_1 = corrected_preference_matrix[0, 1]
+            if not np.isnan(corrected_prob_0_over_1):
+                is_correct = corrected_prob_0_over_1 > 0.5
                 correct_predictions += int(is_correct)
                 total_predictions += 1
 
-        # Convert NaN values to None for JSON serialization
+        # Convert NaN values to None for JSON serialization (for raw matrix)
         preference_matrix_list = preference_matrix.tolist()
         preference_matrix_serializable = [
             [None if (isinstance(val, float) and np.isnan(val)) else val for val in row]
             for row in preference_matrix_list
         ]
 
+        # Convert corrected matrix for JSON serialization
+        corrected_matrix_list = corrected_preference_matrix.tolist()
+        corrected_matrix_serializable = [
+            [None if (isinstance(val, float) and np.isnan(val)) else val for val in row]
+            for row in corrected_matrix_list
+        ]
+
         result = {
             "sample_id": sample_idx,
             "prompt": metadata['original_prompt'],
             "responses": metadata['all_responses'],
-            "preference_matrix": preference_matrix_serializable,
+            "preference_matrix": preference_matrix_serializable,  # Raw matrix
+            "corrected_preference_matrix": corrected_matrix_serializable,  # Position-bias corrected
             "detailed_comparisons": comparisons,
             # "original_rm_scores": metadata['original_rm_scores'],
             "is_correct": bool(is_correct),
-            "predicted_winner_prob": float(preference_matrix[0, 1]) if not np.isnan(preference_matrix[0, 1]) else None
+            "predicted_winner_prob": float(corrected_preference_matrix[0, 1]) if not np.isnan(corrected_preference_matrix[0, 1]) else None
         }
 
         final_results.append(result)
