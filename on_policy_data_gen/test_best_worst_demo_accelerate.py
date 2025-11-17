@@ -252,9 +252,12 @@ def compute_accuracy_batch(model, tokenizer, token_a_id, token_b_id, batch, use_
     return results
 
 
-def compute_best_worst_demo_indices(icl_gain_results, top_k=5):
+def compute_best_worst_demo_indices(icl_gain_results, top_k=5, rank_by='snr_prob_gain'):
     """
-    Compute best and worst demonstration indices from ICL gain results using SNR.
+    Compute best and worst demonstration indices based on prediction metrics.
+
+    At prediction time, we average over both test orderings for each context configuration.
+    So for each training demo, we have num_validation × 2 data points (2 context configs).
 
     Args:
         icl_gain_results: numpy array of shape (num_training, num_validation, 6)
@@ -265,46 +268,79 @@ def compute_best_worst_demo_indices(icl_gain_results, top_k=5):
             [4]: log P(A|x) when test: A=yw B=yl (no context)
             [5]: log P(B|x) when test: A=yl B=yw (no context)
         top_k: number of best and worst samples to return
+        rank_by: metric to rank by ('snr_prob_gain', 'mean_prob_gain', 'snr_acc_gain', 'mean_acc_gain')
 
     Returns:
         best_demo_indices: list of top_k best demonstration indices
         worst_demo_indices: list of top_k worst demonstration indices
-        avg_gains: average gain for each training example (num_training,)
-        std_gains: standard deviation of gain for each training example (num_training,)
-        snr: signal-to-noise ratio for each training example (num_training,)
+        metrics: dictionary with all computed metrics
     """
     num_training, num_validation, _ = icl_gain_results.shape
 
-    # Compute gains for each (training, validation) pair
-    gains = np.zeros((num_training, num_validation, 4))
+    # Convert log probs to probs
+    prob_with_ctx_noflip_test1 = np.exp(icl_gain_results[:, :, 0])
+    prob_with_ctx_noflip_test2 = np.exp(icl_gain_results[:, :, 1])
+    prob_with_ctx_flip_test1 = np.exp(icl_gain_results[:, :, 2])
+    prob_with_ctx_flip_test2 = np.exp(icl_gain_results[:, :, 3])
+    prob_no_ctx_test1 = np.exp(icl_gain_results[:, :, 4])
+    prob_no_ctx_test2 = np.exp(icl_gain_results[:, :, 5])
 
-    # Gain 1: demo noflip, test A=yw B=yl
-    gains[:, :, 0] = icl_gain_results[:, :, 0] - icl_gain_results[:, :, 4]
+    # Average over test orderings for each context config
+    avg_prob_ctx_noflip = (prob_with_ctx_noflip_test1 + prob_with_ctx_noflip_test2) / 2
+    avg_prob_ctx_flip = (prob_with_ctx_flip_test1 + prob_with_ctx_flip_test2) / 2
+    avg_prob_no_ctx = (prob_no_ctx_test1 + prob_no_ctx_test2) / 2
 
-    # Gain 2: demo noflip, test A=yl B=yw (flipped)
-    gains[:, :, 1] = icl_gain_results[:, :, 1] - icl_gain_results[:, :, 5]
+    # Stack 2 context configs: (num_training, num_validation, 2)
+    avg_prob_with_ctx = np.stack([avg_prob_ctx_noflip, avg_prob_ctx_flip], axis=2)
 
-    # Gain 3: demo flip, test A=yw B=yl
-    gains[:, :, 2] = icl_gain_results[:, :, 2] - icl_gain_results[:, :, 4]
+    # Flatten to (num_training, num_validation * 2)
+    avg_prob_with_ctx_flat = avg_prob_with_ctx.reshape(num_training, -1)
+    avg_prob_no_ctx_flat = np.repeat(avg_prob_no_ctx, 2, axis=1)
 
-    # Gain 4: demo flip, test A=yl B=yw (flipped)
-    gains[:, :, 3] = icl_gain_results[:, :, 3] - icl_gain_results[:, :, 5]
+    # Probability gain
+    prob_gain_flat = avg_prob_with_ctx_flat - avg_prob_no_ctx_flat
+    mean_prob_gain = np.mean(prob_gain_flat, axis=1)
+    std_prob_gain = np.std(prob_gain_flat, axis=1)
+    snr_prob_gain = mean_prob_gain / (std_prob_gain + 1e-10)
 
-    # Reshape to (num_training, num_validation * 4) for mean and std calculation
-    gains_flattened = gains.reshape(num_training, -1)
+    # Accuracy (prob > 0.5)
+    acc_with_ctx_flat = (avg_prob_with_ctx_flat > 0.5).astype(float)
+    acc_no_ctx_flat = (avg_prob_no_ctx_flat > 0.5).astype(float)
 
-    # Calculate mean and std for each training sample over all (validation * 4) samples
-    avg_gains = np.mean(gains_flattened, axis=1)  # (num_training,)
-    std_gains = np.std(gains_flattened, axis=1)   # (num_training,)
+    # Accuracy gain
+    acc_gain_flat = acc_with_ctx_flat - acc_no_ctx_flat
+    mean_acc_gain = np.mean(acc_gain_flat, axis=1)
+    std_acc_gain = np.std(acc_gain_flat, axis=1)
+    snr_acc_gain = mean_acc_gain / (std_acc_gain + 1e-10)
 
-    # Calculate SNR (mean / std) with small epsilon to avoid division by zero
-    snr = avg_gains / (std_gains + 1e-10)
+    # Select ranking metric
+    ranking_metrics = {
+        'snr_prob_gain': snr_prob_gain,
+        'mean_prob_gain': mean_prob_gain,
+        'snr_acc_gain': snr_acc_gain,
+        'mean_acc_gain': mean_acc_gain,
+    }
 
-    # Find top_k best and worst demonstrations by SNR
-    best_demo_indices = np.argsort(snr)[-top_k:][::-1]  # Top k, descending order
-    worst_demo_indices = np.argsort(snr)[:top_k]        # Bottom k, ascending order
+    if rank_by not in ranking_metrics:
+        raise ValueError(f"Invalid rank_by: {rank_by}")
 
-    return best_demo_indices.tolist(), worst_demo_indices.tolist(), avg_gains, std_gains, snr
+    ranking_values = ranking_metrics[rank_by]
+
+    # Find top_k best and worst
+    best_demo_indices = np.argsort(ranking_values)[-top_k:][::-1]
+    worst_demo_indices = np.argsort(ranking_values)[:top_k]
+
+    metrics = {
+        'mean_prob_gain': mean_prob_gain,
+        'std_prob_gain': std_prob_gain,
+        'snr_prob_gain': snr_prob_gain,
+        'mean_acc_gain': mean_acc_gain,
+        'std_acc_gain': std_acc_gain,
+        'snr_acc_gain': snr_acc_gain,
+        'rank_by': rank_by,
+    }
+
+    return best_demo_indices.tolist(), worst_demo_indices.tolist(), metrics
 
 
 def test_with_demo(model_name, dataset_name, persona_id, demo_idx, demo_type, output_dir, batch_size=4):
@@ -473,6 +509,9 @@ def parse_args():
                        help="Which demonstration to test with (all includes best, worst, and no_context)")
     parser.add_argument("--top_k", type=int, default=5,
                        help="Number of best and worst samples to test")
+    parser.add_argument("--rank_by", type=str, default="snr_prob_gain",
+                       choices=["snr_prob_gain", "mean_prob_gain", "snr_acc_gain", "mean_acc_gain"],
+                       help="Metric to rank demonstrations by")
     return parser.parse_args()
 
 
@@ -484,40 +523,43 @@ def main():
     icl_gain_results = np.load(args.icl_gain_results_file)
     logger.info(f"ICL gain results shape: {icl_gain_results.shape}")
 
-    # Compute best and worst demonstration indices using SNR
-    logger.info(f"Computing top {args.top_k} best and worst demonstration indices using SNR...")
-    best_demo_indices, worst_demo_indices, avg_gains, std_gains, snr = compute_best_worst_demo_indices(
-        icl_gain_results, top_k=args.top_k)
+    # Compute best and worst demonstration indices
+    logger.info(f"Computing top {args.top_k} best and worst demonstration indices using {args.rank_by}...")
+    best_demo_indices, worst_demo_indices, metrics = compute_best_worst_demo_indices(
+        icl_gain_results, top_k=args.top_k, rank_by=args.rank_by)
 
     logger.info(f"\n{'='*80}")
-    logger.info(f"Top {args.top_k} BEST demonstrations (by SNR):")
+    logger.info(f"Top {args.top_k} BEST demonstrations (ranked by {args.rank_by}):")
     logger.info(f"{'='*80}")
     for rank, idx in enumerate(best_demo_indices, 1):
-        logger.info(f"  Rank {rank}: Index {idx} - Mean: {avg_gains[idx]:.4f}, Std: {std_gains[idx]:.4f}, SNR: {snr[idx]:.4f}")
+        logger.info(f"  Rank {rank}: Index {idx}")
+        logger.info(f"    Prob gain: {metrics['mean_prob_gain'][idx]:.4f} ± {metrics['std_prob_gain'][idx]:.4f} (SNR: {metrics['snr_prob_gain'][idx]:.4f})")
+        logger.info(f"    Acc gain: {metrics['mean_acc_gain'][idx]:.4f} ± {metrics['std_acc_gain'][idx]:.4f} (SNR: {metrics['snr_acc_gain'][idx]:.4f})")
 
     logger.info(f"\n{'='*80}")
-    logger.info(f"Top {args.top_k} WORST demonstrations (by SNR):")
+    logger.info(f"Top {args.top_k} WORST demonstrations (ranked by {args.rank_by}):")
     logger.info(f"{'='*80}")
     for rank, idx in enumerate(worst_demo_indices, 1):
-        logger.info(f"  Rank {rank}: Index {idx} - Mean: {avg_gains[idx]:.4f}, Std: {std_gains[idx]:.4f}, SNR: {snr[idx]:.4f}")
+        logger.info(f"  Rank {rank}: Index {idx}")
+        logger.info(f"    Prob gain: {metrics['mean_prob_gain'][idx]:.4f} ± {metrics['std_prob_gain'][idx]:.4f} (SNR: {metrics['snr_prob_gain'][idx]:.4f})")
+        logger.info(f"    Acc gain: {metrics['mean_acc_gain'][idx]:.4f} ± {metrics['std_acc_gain'][idx]:.4f} (SNR: {metrics['snr_acc_gain'][idx]:.4f})")
 
     logger.info(f"\n{'='*80}")
     logger.info(f"Overall statistics:")
     logger.info(f"{'='*80}")
-    logger.info(f"Avg gain - Mean: {avg_gains.mean():.4f}, Std: {avg_gains.std():.4f}, Min: {avg_gains.min():.4f}, Max: {avg_gains.max():.4f}")
-    logger.info(f"Std gain - Mean: {std_gains.mean():.4f}, Std: {std_gains.std():.4f}, Min: {std_gains.min():.4f}, Max: {std_gains.max():.4f}")
-    logger.info(f"SNR - Mean: {snr.mean():.4f}, Std: {snr.std():.4f}, Min: {snr.min():.4f}, Max: {snr.max():.4f}\n")
+    logger.info(f"Mean prob gain: {np.mean(metrics['mean_prob_gain']):.4f} ± {np.std(metrics['mean_prob_gain']):.4f}")
+    logger.info(f"Mean acc gain: {np.mean(metrics['mean_acc_gain']):.4f} ± {np.std(metrics['mean_acc_gain']):.4f}")
+    logger.info(f"SNR prob gain: {np.mean(metrics['snr_prob_gain']):.4f} ± {np.std(metrics['snr_prob_gain']):.4f}")
+    logger.info(f"SNR acc gain: {np.mean(metrics['snr_acc_gain']):.4f} ± {np.std(metrics['snr_acc_gain']):.4f}\n")
 
     # Save the demo indices for future use
     os.makedirs(args.output_dir, exist_ok=True)
-    indices_file = os.path.join(args.output_dir, f"top{args.top_k}_best_worst_demo_indices.npz")
+    indices_file = os.path.join(args.output_dir, f"top{args.top_k}_best_worst_demo_indices_{args.rank_by}.npz")
     np.savez(indices_file,
              best_demo_indices=best_demo_indices,
              worst_demo_indices=worst_demo_indices,
-             avg_gains=avg_gains,
-             std_gains=std_gains,
-             snr=snr,
-             top_k=args.top_k)
+             top_k=args.top_k,
+             **metrics)
     logger.info(f"Saved demo indices to: {indices_file}\n")
 
     # Run tests for best demonstrations
