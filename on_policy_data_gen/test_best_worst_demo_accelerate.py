@@ -252,9 +252,9 @@ def compute_accuracy_batch(model, tokenizer, token_a_id, token_b_id, batch, use_
     return results
 
 
-def compute_best_worst_demo_indices(icl_gain_results):
+def compute_best_worst_demo_indices(icl_gain_results, top_k=5):
     """
-    Compute best and worst demonstration indices from ICL gain results.
+    Compute best and worst demonstration indices from ICL gain results using SNR.
 
     Args:
         icl_gain_results: numpy array of shape (num_training, num_validation, 6)
@@ -264,47 +264,47 @@ def compute_best_worst_demo_indices(icl_gain_results):
             [3]: log P(B|x, ctx) when demo: A=yl B=yw [[B]], test: A=yl B=yw
             [4]: log P(A|x) when test: A=yw B=yl (no context)
             [5]: log P(B|x) when test: A=yl B=yw (no context)
+        top_k: number of best and worst samples to return
 
     Returns:
-        best_demo_idx: index of best demonstration
-        worst_demo_idx: index of worst demonstration
+        best_demo_indices: list of top_k best demonstration indices
+        worst_demo_indices: list of top_k worst demonstration indices
         avg_gains: average gain for each training example (num_training,)
+        std_gains: standard deviation of gain for each training example (num_training,)
+        snr: signal-to-noise ratio for each training example (num_training,)
     """
     num_training, num_validation, _ = icl_gain_results.shape
 
     # Compute gains for each (training, validation) pair
-    # Gain = average of:
-    #   - (log P(y|x, ctx) - log P(y|x)) for demo noflip, test noflip
-    #   - (log P(y|x, ctx) - log P(y|x)) for demo noflip, test flip
-    #   - (log P(y|x, ctx) - log P(y|x)) for demo flip, test noflip
-    #   - (log P(y|x, ctx) - log P(y|x)) for demo flip, test flip
-
     gains = np.zeros((num_training, num_validation, 4))
 
     # Gain 1: demo noflip, test A=yw B=yl
-    # Should prefer A, so gain = log P(A|x,ctx) - log P(A|x)
     gains[:, :, 0] = icl_gain_results[:, :, 0] - icl_gain_results[:, :, 4]
 
     # Gain 2: demo noflip, test A=yl B=yw (flipped)
-    # Should prefer B, so gain = log P(B|x,ctx) - log P(B|x)
     gains[:, :, 1] = icl_gain_results[:, :, 1] - icl_gain_results[:, :, 5]
 
     # Gain 3: demo flip, test A=yw B=yl
-    # Should prefer A, so gain = log P(A|x,ctx) - log P(A|x)
     gains[:, :, 2] = icl_gain_results[:, :, 2] - icl_gain_results[:, :, 4]
 
     # Gain 4: demo flip, test A=yl B=yw (flipped)
-    # Should prefer B, so gain = log P(B|x,ctx) - log P(B|x)
     gains[:, :, 3] = icl_gain_results[:, :, 3] - icl_gain_results[:, :, 5]
 
-    # Average gain across all validation examples and 4 configurations
-    avg_gains = gains.mean(axis=(1, 2))  # (num_training,)
+    # Reshape to (num_training, num_validation * 4) for mean and std calculation
+    gains_flattened = gains.reshape(num_training, -1)
 
-    # Find best and worst demonstrations
-    best_demo_idx = int(np.argmax(avg_gains))
-    worst_demo_idx = int(np.argmin(avg_gains))
+    # Calculate mean and std for each training sample over all (validation * 4) samples
+    avg_gains = np.mean(gains_flattened, axis=1)  # (num_training,)
+    std_gains = np.std(gains_flattened, axis=1)   # (num_training,)
 
-    return best_demo_idx, worst_demo_idx, avg_gains
+    # Calculate SNR (mean / std) with small epsilon to avoid division by zero
+    snr = avg_gains / (std_gains + 1e-10)
+
+    # Find top_k best and worst demonstrations by SNR
+    best_demo_indices = np.argsort(snr)[-top_k:][::-1]  # Top k, descending order
+    worst_demo_indices = np.argsort(snr)[:top_k]        # Bottom k, ascending order
+
+    return best_demo_indices.tolist(), worst_demo_indices.tolist(), avg_gains, std_gains, snr
 
 
 def test_with_demo(model_name, dataset_name, persona_id, demo_idx, demo_type, output_dir, batch_size=4):
@@ -471,6 +471,8 @@ def parse_args():
     parser.add_argument("--demo_type", type=str, choices=["best", "worst", "no_context", "all"],
                        default="all",
                        help="Which demonstration to test with (all includes best, worst, and no_context)")
+    parser.add_argument("--top_k", type=int, default=5,
+                       help="Number of best and worst samples to test")
     return parser.parse_args()
 
 
@@ -482,47 +484,81 @@ def main():
     icl_gain_results = np.load(args.icl_gain_results_file)
     logger.info(f"ICL gain results shape: {icl_gain_results.shape}")
 
-    # Compute best and worst demonstration indices
-    logger.info("Computing best and worst demonstration indices...")
-    best_demo_idx, worst_demo_idx, avg_gains = compute_best_worst_demo_indices(icl_gain_results)
+    # Compute best and worst demonstration indices using SNR
+    logger.info(f"Computing top {args.top_k} best and worst demonstration indices using SNR...")
+    best_demo_indices, worst_demo_indices, avg_gains, std_gains, snr = compute_best_worst_demo_indices(
+        icl_gain_results, top_k=args.top_k)
 
-    logger.info(f"\nBest demo index: {best_demo_idx} (avg gain: {avg_gains[best_demo_idx]:.4f})")
-    logger.info(f"Worst demo index: {worst_demo_idx} (avg gain: {avg_gains[worst_demo_idx]:.4f})")
-    logger.info(f"Avg gain statistics - Mean: {avg_gains.mean():.4f}, Std: {avg_gains.std():.4f}")
-    logger.info(f"Avg gain statistics - Min: {avg_gains.min():.4f}, Max: {avg_gains.max():.4f}\n")
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Top {args.top_k} BEST demonstrations (by SNR):")
+    logger.info(f"{'='*80}")
+    for rank, idx in enumerate(best_demo_indices, 1):
+        logger.info(f"  Rank {rank}: Index {idx} - Mean: {avg_gains[idx]:.4f}, Std: {std_gains[idx]:.4f}, SNR: {snr[idx]:.4f}")
 
-    # Optionally save the demo indices for future use
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Top {args.top_k} WORST demonstrations (by SNR):")
+    logger.info(f"{'='*80}")
+    for rank, idx in enumerate(worst_demo_indices, 1):
+        logger.info(f"  Rank {rank}: Index {idx} - Mean: {avg_gains[idx]:.4f}, Std: {std_gains[idx]:.4f}, SNR: {snr[idx]:.4f}")
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Overall statistics:")
+    logger.info(f"{'='*80}")
+    logger.info(f"Avg gain - Mean: {avg_gains.mean():.4f}, Std: {avg_gains.std():.4f}, Min: {avg_gains.min():.4f}, Max: {avg_gains.max():.4f}")
+    logger.info(f"Std gain - Mean: {std_gains.mean():.4f}, Std: {std_gains.std():.4f}, Min: {std_gains.min():.4f}, Max: {std_gains.max():.4f}")
+    logger.info(f"SNR - Mean: {snr.mean():.4f}, Std: {snr.std():.4f}, Min: {snr.min():.4f}, Max: {snr.max():.4f}\n")
+
+    # Save the demo indices for future use
     os.makedirs(args.output_dir, exist_ok=True)
-    indices_file = os.path.join(args.output_dir, "best_worst_demo_indices.npz")
+    indices_file = os.path.join(args.output_dir, f"top{args.top_k}_best_worst_demo_indices.npz")
     np.savez(indices_file,
-             best_demo_idx=best_demo_idx,
-             worst_demo_idx=worst_demo_idx,
-             avg_gains=avg_gains)
+             best_demo_indices=best_demo_indices,
+             worst_demo_indices=worst_demo_indices,
+             avg_gains=avg_gains,
+             std_gains=std_gains,
+             snr=snr,
+             top_k=args.top_k)
     logger.info(f"Saved demo indices to: {indices_file}\n")
 
+    # Run tests for best demonstrations
     if args.demo_type in ["best", "all"]:
-        test_with_demo(
-            model_name=args.model_name,
-            dataset_name=args.dataset_name,
-            persona_id=args.persona_id,
-            demo_idx=best_demo_idx,
-            demo_type="best",
-            output_dir=args.output_dir,
-            batch_size=args.batch_size
-        )
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing with TOP {args.top_k} BEST demonstrations")
+        logger.info(f"{'='*80}\n")
+        for rank, demo_idx in enumerate(best_demo_indices, 1):
+            logger.info(f"\n--- Testing BEST demo rank {rank} (index {demo_idx}) ---\n")
+            test_with_demo(
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                persona_id=args.persona_id,
+                demo_idx=demo_idx,
+                demo_type=f"best_rank{rank}",
+                output_dir=args.output_dir,
+                batch_size=args.batch_size
+            )
 
+    # Run tests for worst demonstrations
     if args.demo_type in ["worst", "all"]:
-        test_with_demo(
-            model_name=args.model_name,
-            dataset_name=args.dataset_name,
-            persona_id=args.persona_id,
-            demo_idx=worst_demo_idx,
-            demo_type="worst",
-            output_dir=args.output_dir,
-            batch_size=args.batch_size
-        )
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing with TOP {args.top_k} WORST demonstrations")
+        logger.info(f"{'='*80}\n")
+        for rank, demo_idx in enumerate(worst_demo_indices, 1):
+            logger.info(f"\n--- Testing WORST demo rank {rank} (index {demo_idx}) ---\n")
+            test_with_demo(
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                persona_id=args.persona_id,
+                demo_idx=demo_idx,
+                demo_type=f"worst_rank{rank}",
+                output_dir=args.output_dir,
+                batch_size=args.batch_size
+            )
 
+    # Run test with no context
     if args.demo_type in ["no_context", "all"]:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing with NO CONTEXT (baseline)")
+        logger.info(f"{'='*80}\n")
         test_with_demo(
             model_name=args.model_name,
             dataset_name=args.dataset_name,
