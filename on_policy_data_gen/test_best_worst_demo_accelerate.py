@@ -259,6 +259,9 @@ def compute_best_worst_demo_indices(icl_gain_results, top_k=5, rank_by='snr_prob
     At prediction time, we average over both test orderings for each context configuration.
     So for each training demo, we have num_validation × 2 data points (2 context configs).
 
+    The gain is computed as: log P(correct|with context) - log P(correct|no context)
+    where the probabilities are first averaged across test orderings, then converted back to log space.
+
     Args:
         icl_gain_results: numpy array of shape (num_training, num_validation, 6)
             [0]: log P(A|x, ctx) when demo: A=yw B=yl [[A]], test: A=yw B=yl
@@ -268,7 +271,13 @@ def compute_best_worst_demo_indices(icl_gain_results, top_k=5, rank_by='snr_prob
             [4]: log P(A|x) when test: A=yw B=yl (no context)
             [5]: log P(B|x) when test: A=yl B=yw (no context)
         top_k: number of best and worst samples to return
-        rank_by: metric to rank by ('snr_prob_gain', 'mean_prob_gain', 'snr_acc_gain', 'mean_acc_gain')
+        rank_by: metric to rank by
+            - 'snr_prob_gain': SNR of log probability gain
+            - 'mean_prob_gain': Mean log probability gain
+            - 'snr_acc_gain': SNR of accuracy gain
+            - 'mean_acc_gain': Mean accuracy gain
+            - 'snr_prob_gain_filtered': Filter by SNR acc gain (>0.05 for best, <-0.05 for worst),
+                                        then rank by SNR of log probability gain
 
     Returns:
         best_demo_indices: list of top_k best demonstration indices
@@ -276,6 +285,13 @@ def compute_best_worst_demo_indices(icl_gain_results, top_k=5, rank_by='snr_prob
         metrics: dictionary with all computed metrics
     """
     num_training, num_validation, _ = icl_gain_results.shape
+
+    # Computation steps:
+    # 1. Convert log probs to probs
+    # 2. Average probs across test orderings
+    # 3. Convert averaged probs back to log probs
+    # 4. Compute log prob gain: log P(correct|with context) - log P(correct|no context)
+    # 5. Compute SNR of log prob gain
 
     # Convert log probs to probs
     prob_with_ctx_noflip_test1 = np.exp(icl_gain_results[:, :, 0])
@@ -290,18 +306,28 @@ def compute_best_worst_demo_indices(icl_gain_results, top_k=5, rank_by='snr_prob
     avg_prob_ctx_flip = (prob_with_ctx_flip_test1 + prob_with_ctx_flip_test2) / 2
     avg_prob_no_ctx = (prob_no_ctx_test1 + prob_no_ctx_test2) / 2
 
+    # Convert averaged probs back to log probs
+    avg_log_prob_ctx_noflip = np.log(avg_prob_ctx_noflip + 1e-10)
+    avg_log_prob_ctx_flip = np.log(avg_prob_ctx_flip + 1e-10)
+    avg_log_prob_no_ctx = np.log(avg_prob_no_ctx + 1e-10)
+
     # Stack 2 context configs: (num_training, num_validation, 2)
-    avg_prob_with_ctx = np.stack([avg_prob_ctx_noflip, avg_prob_ctx_flip], axis=2)
+    avg_log_prob_with_ctx = np.stack([avg_log_prob_ctx_noflip, avg_log_prob_ctx_flip], axis=2)
 
     # Flatten to (num_training, num_validation * 2)
+    avg_log_prob_with_ctx_flat = avg_log_prob_with_ctx.reshape(num_training, -1)
+    avg_log_prob_no_ctx_flat = np.repeat(avg_log_prob_no_ctx, 2, axis=1)
+
+    # Log probability gain: log P(correct|with context) - log P(correct|no context)
+    log_prob_gain_flat = avg_log_prob_with_ctx_flat - avg_log_prob_no_ctx_flat
+    mean_log_prob_gain = np.mean(log_prob_gain_flat, axis=1)
+    std_log_prob_gain = np.std(log_prob_gain_flat, axis=1)
+    snr_log_prob_gain = mean_log_prob_gain / (std_log_prob_gain + 1e-10)
+
+    # Prepare averaged probs for accuracy calculation (flatten the same way as log probs)
+    avg_prob_with_ctx = np.stack([avg_prob_ctx_noflip, avg_prob_ctx_flip], axis=2)
     avg_prob_with_ctx_flat = avg_prob_with_ctx.reshape(num_training, -1)
     avg_prob_no_ctx_flat = np.repeat(avg_prob_no_ctx, 2, axis=1)
-
-    # Probability gain
-    prob_gain_flat = avg_prob_with_ctx_flat - avg_prob_no_ctx_flat
-    mean_prob_gain = np.mean(prob_gain_flat, axis=1)
-    std_prob_gain = np.std(prob_gain_flat, axis=1)
-    snr_prob_gain = mean_prob_gain / (std_prob_gain + 1e-10)
 
     # Accuracy (prob > 0.5)
     acc_with_ctx_flat = (avg_prob_with_ctx_flat > 0.5).astype(float)
@@ -314,26 +340,69 @@ def compute_best_worst_demo_indices(icl_gain_results, top_k=5, rank_by='snr_prob
     snr_acc_gain = mean_acc_gain / (std_acc_gain + 1e-10)
 
     # Select ranking metric
-    ranking_metrics = {
-        'snr_prob_gain': snr_prob_gain,
-        'mean_prob_gain': mean_prob_gain,
-        'snr_acc_gain': snr_acc_gain,
-        'mean_acc_gain': mean_acc_gain,
-    }
+    if rank_by == 'snr_prob_gain_filtered':
+        # Filter by SNR of accuracy gain, then rank by SNR of log probability gain
+        # For best: snr_acc_gain > 0.05
+        # For worst: snr_acc_gain < -0.05
+        good_mask = snr_acc_gain > 0.05
+        bad_mask = snr_acc_gain < -0.05
 
-    if rank_by not in ranking_metrics:
-        raise ValueError(f"Invalid rank_by: {rank_by}")
+        good_indices = np.where(good_mask)[0]
+        bad_indices = np.where(bad_mask)[0]
 
-    ranking_values = ranking_metrics[rank_by]
+        # Rank filtered demos by log prob SNR
+        if len(good_indices) >= top_k:
+            good_snr = snr_log_prob_gain[good_indices]
+            best_in_filtered = np.argsort(good_snr)[-top_k:][::-1]
+            best_demo_indices = good_indices[best_in_filtered]
+        else:
+            logger.warning(f"Only {len(good_indices)} demos with SNR acc gain > 0.05, requested {top_k}")
+            if len(good_indices) > 0:
+                good_snr = snr_log_prob_gain[good_indices]
+                best_in_filtered = np.argsort(good_snr)[::-1]
+                best_demo_indices = good_indices[best_in_filtered]
+            else:
+                # Fallback to top by log prob SNR if no demos pass filter
+                logger.warning("No demos with SNR acc gain > 0.05, using unfiltered ranking")
+                best_demo_indices = np.argsort(snr_log_prob_gain)[-top_k:][::-1]
 
-    # Find top_k best and worst
-    best_demo_indices = np.argsort(ranking_values)[-top_k:][::-1]
-    worst_demo_indices = np.argsort(ranking_values)[:top_k]
+        if len(bad_indices) >= top_k:
+            bad_snr = snr_log_prob_gain[bad_indices]
+            worst_in_filtered = np.argsort(bad_snr)[:top_k]
+            worst_demo_indices = bad_indices[worst_in_filtered]
+        else:
+            logger.warning(f"Only {len(bad_indices)} demos with SNR acc gain < -0.05, requested {top_k}")
+            if len(bad_indices) > 0:
+                bad_snr = snr_log_prob_gain[bad_indices]
+                worst_in_filtered = np.argsort(bad_snr)
+                worst_demo_indices = bad_indices[worst_in_filtered]
+            else:
+                # Fallback to bottom by log prob SNR if no demos pass filter
+                logger.warning("No demos with SNR acc gain < -0.05, using unfiltered ranking")
+                worst_demo_indices = np.argsort(snr_log_prob_gain)[:top_k]
+
+    else:
+        # Standard ranking methods
+        ranking_metrics = {
+            'snr_prob_gain': snr_log_prob_gain,
+            'mean_prob_gain': mean_log_prob_gain,
+            'snr_acc_gain': snr_acc_gain,
+            'mean_acc_gain': mean_acc_gain,
+        }
+
+        if rank_by not in ranking_metrics:
+            raise ValueError(f"Invalid rank_by: {rank_by}. Must be one of: {list(ranking_metrics.keys())} or 'snr_prob_gain_filtered'")
+
+        ranking_values = ranking_metrics[rank_by]
+
+        # Find top_k best and worst
+        best_demo_indices = np.argsort(ranking_values)[-top_k:][::-1]
+        worst_demo_indices = np.argsort(ranking_values)[:top_k]
 
     metrics = {
-        'mean_prob_gain': mean_prob_gain,
-        'std_prob_gain': std_prob_gain,
-        'snr_prob_gain': snr_prob_gain,
+        'mean_log_prob_gain': mean_log_prob_gain,
+        'std_log_prob_gain': std_log_prob_gain,
+        'snr_log_prob_gain': snr_log_prob_gain,
         'mean_acc_gain': mean_acc_gain,
         'std_acc_gain': std_acc_gain,
         'snr_acc_gain': snr_acc_gain,
@@ -510,7 +579,7 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=5,
                        help="Number of best and worst samples to test")
     parser.add_argument("--rank_by", type=str, default="snr_prob_gain",
-                       choices=["snr_prob_gain", "mean_prob_gain", "snr_acc_gain", "mean_acc_gain"],
+                       choices=["snr_prob_gain", "mean_prob_gain", "snr_acc_gain", "mean_acc_gain", "snr_prob_gain_filtered"],
                        help="Metric to rank demonstrations by")
     return parser.parse_args()
 
@@ -533,7 +602,7 @@ def main():
     logger.info(f"{'='*80}")
     for rank, idx in enumerate(best_demo_indices, 1):
         logger.info(f"  Rank {rank}: Index {idx}")
-        logger.info(f"    Prob gain: {metrics['mean_prob_gain'][idx]:.4f} ± {metrics['std_prob_gain'][idx]:.4f} (SNR: {metrics['snr_prob_gain'][idx]:.4f})")
+        logger.info(f"    Log prob gain: {metrics['mean_log_prob_gain'][idx]:.4f} ± {metrics['std_log_prob_gain'][idx]:.4f} (SNR: {metrics['snr_log_prob_gain'][idx]:.4f})")
         logger.info(f"    Acc gain: {metrics['mean_acc_gain'][idx]:.4f} ± {metrics['std_acc_gain'][idx]:.4f} (SNR: {metrics['snr_acc_gain'][idx]:.4f})")
 
     logger.info(f"\n{'='*80}")
@@ -541,15 +610,15 @@ def main():
     logger.info(f"{'='*80}")
     for rank, idx in enumerate(worst_demo_indices, 1):
         logger.info(f"  Rank {rank}: Index {idx}")
-        logger.info(f"    Prob gain: {metrics['mean_prob_gain'][idx]:.4f} ± {metrics['std_prob_gain'][idx]:.4f} (SNR: {metrics['snr_prob_gain'][idx]:.4f})")
+        logger.info(f"    Log prob gain: {metrics['mean_log_prob_gain'][idx]:.4f} ± {metrics['std_log_prob_gain'][idx]:.4f} (SNR: {metrics['snr_log_prob_gain'][idx]:.4f})")
         logger.info(f"    Acc gain: {metrics['mean_acc_gain'][idx]:.4f} ± {metrics['std_acc_gain'][idx]:.4f} (SNR: {metrics['snr_acc_gain'][idx]:.4f})")
 
     logger.info(f"\n{'='*80}")
     logger.info(f"Overall statistics:")
     logger.info(f"{'='*80}")
-    logger.info(f"Mean prob gain: {np.mean(metrics['mean_prob_gain']):.4f} ± {np.std(metrics['mean_prob_gain']):.4f}")
+    logger.info(f"Mean log prob gain: {np.mean(metrics['mean_log_prob_gain']):.4f} ± {np.std(metrics['mean_log_prob_gain']):.4f}")
     logger.info(f"Mean acc gain: {np.mean(metrics['mean_acc_gain']):.4f} ± {np.std(metrics['mean_acc_gain']):.4f}")
-    logger.info(f"SNR prob gain: {np.mean(metrics['snr_prob_gain']):.4f} ± {np.std(metrics['snr_prob_gain']):.4f}")
+    logger.info(f"SNR log prob gain: {np.mean(metrics['snr_log_prob_gain']):.4f} ± {np.std(metrics['snr_log_prob_gain']):.4f}")
     logger.info(f"SNR acc gain: {np.mean(metrics['snr_acc_gain']):.4f} ± {np.std(metrics['snr_acc_gain']):.4f}\n")
 
     # Save the demo indices for future use
