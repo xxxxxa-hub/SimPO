@@ -346,6 +346,8 @@ def parse_args():
                        help="Random seed")
     parser.add_argument("--top_n", type=int, default=5,
                        help="Number of best contexts to optimize")
+    parser.add_argument("--start_idx", type=int, default=0,
+                       help="Which context to start from (0=best, 1=second best, etc.)")
     parser.add_argument("--n_candidates", type=int, default=100,
                        help="Number of test examples to try as replacements")
     return parser.parse_args()
@@ -375,7 +377,7 @@ def main():
     # Load validation results
     if accelerator.is_main_process:
         logger.info(f"\nLoading validation results from: {args.validation_results_file}")
-
+    breakpoint()
     validation_results = np.load(args.validation_results_file)
 
     if accelerator.is_main_process:
@@ -387,16 +389,29 @@ def main():
         k = int(validation_results['k'])
 
         logger.info(f"Loaded {len(all_tuples)} tuples, k={k}")
-        logger.info(f"Candidate demonstrations from training: {candidate_demo_indices}")
+        logger.info(f"Candidate demonstrations from training (indices into training_examples): {candidate_demo_indices}")
 
-        # Select top_n best contexts
-        best_indices = np.argsort(snr)[-args.top_n:][::-1].tolist()
-        initial_contexts = [(list(all_tuples[i]), list(tuple_labels[i])) for i in best_indices]
-        initial_snrs = [snr[i] for i in best_indices]
+        # Select contexts to optimize: start from start_idx, take top_n contexts
+        all_best_indices = np.argsort(snr)[::-1].tolist()  # All indices sorted by SNR (best to worst)
+        selected_indices = all_best_indices[args.start_idx:args.start_idx + args.top_n]
 
-        logger.info(f"\nSelected top {args.top_n} contexts for optimization:")
-        for i, (ctx, snr_val) in enumerate(zip(initial_contexts, initial_snrs)):
-            logger.info(f"  Context {i}: indices={ctx[0]}, labels={ctx[1]}, SNR: {snr_val:.4f}")
+        # Map tuple indices through candidate_demo_indices
+        # all_tuples[i] contains indices 0-7 (positions in the 8 labeled examples)
+        # candidate_demo_indices maps these to actual indices in training_examples
+        initial_contexts = []
+        for i in selected_indices:
+            tuple_indices = all_tuples[i]  # e.g., (0, 2, 5, 7) - positions in the 8 labeled examples
+            labels = tuple_labels[i]       # e.g., (False, True, False, True)
+
+            # Map through candidate_demo_indices to get actual indices in training_examples/candidate_examples
+            actual_indices = [candidate_demo_indices[j] for j in tuple_indices]
+            initial_contexts.append((actual_indices, list(labels)))
+
+        initial_snrs = [snr[i] for i in selected_indices]
+
+        logger.info(f"\nSelected {len(initial_contexts)} contexts for optimization (starting from rank {args.start_idx}):")
+        for i, (ctx, snr_val, idx) in enumerate(zip(initial_contexts, initial_snrs, selected_indices)):
+            logger.info(f"  Context rank {args.start_idx + i} (idx {idx}): indices={ctx[0]}, labels={ctx[1]}, SNR: {snr_val:.4f}")
 
     # Broadcast to all processes
     if accelerator.num_processes > 1:
@@ -681,7 +696,7 @@ def main():
 
         # Save results
         os.makedirs(args.output_dir, exist_ok=True)
-        output_file = os.path.join(args.output_dir, f"optimized_contexts_{actual_persona_id}.npz")
+        output_file = os.path.join(args.output_dir, f"optimized_contexts_start{args.start_idx}_{actual_persona_id}.npz")
 
         np.savez(output_file,
                  optimized_contexts=optimized_contexts,
