@@ -254,7 +254,7 @@ def compute_log_prob_batch(model, tokenizer, token_a_id, token_b_id, batch):
         metadata.append(meta)
 
     # Tokenize all prompts at once
-    inputs = tokenizer(all_prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
+    inputs = tokenizer(all_prompts, return_tensors="pt", padding=True)
     input_ids = inputs['input_ids'].to(model.device)
     attention_mask = inputs['attention_mask'].to(model.device)
 
@@ -331,7 +331,7 @@ def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
                                      val_example['all_generated_responses'][0],
                                      None, None)
             ]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True)
             input_ids = inputs['input_ids'].to(model.device)
             attention_mask = inputs['attention_mask'].to(model.device)
 
@@ -742,7 +742,7 @@ def main():
                                      test_example['all_generated_responses'][0],
                                      None, None)
             ]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True)
             input_ids = inputs['input_ids'].to(model.device)
             attention_mask = inputs['attention_mask'].to(model.device)
 
