@@ -11,7 +11,6 @@ VALIDATION_RESULTS_FILE="./icl_snr_results/icl_snr_k4_results_${PERSONA_ID}.npz"
 OUTPUT_DIR="./icl_optimized_results"
 BATCH_SIZE=1
 TOP_N=1  # Number of best contexts to optimize
-START_IDX=0  # Which context to start from (0=best, 1=second best, etc.)
 N_CANDIDATES=50  # Number of test examples to try as replacements
 SEED=42
 
@@ -24,6 +23,5 @@ accelerate launch --num_processes 1 \
     --output_dir ${OUTPUT_DIR} \
     --batch_size ${BATCH_SIZE} \
     --top_n ${TOP_N} \
-    --start_idx ${START_IDX} \
     --n_candidates ${N_CANDIDATES} \
     --seed ${SEED}
