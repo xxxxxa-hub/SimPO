@@ -286,7 +286,7 @@ def compute_log_prob_batch(model, tokenizer, token_a_id, token_b_id, batch):
 def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
                                    demo_indices, demo_labels, candidate_examples,
                                    validation_set, batch_size, accelerator):
-    """Evaluate a single context on validation set and return mean log prob."""
+    """Evaluate a single context on validation set and return SNR of gain."""
     dataset = ValidationDataset(demo_indices, demo_labels, candidate_examples, validation_set)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                            collate_fn=collate_fn, num_workers=0)
@@ -307,7 +307,7 @@ def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
                 all_results.extend(results_list)
 
     if accelerator.is_main_process:
-        # Compute mean log prob
+        # Compute log prob with context
         log_probs_raw = np.zeros((len(validation_set), 2))
         for result in all_results:
             val_idx = result['val_idx']
@@ -316,9 +316,46 @@ def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
 
         probs_raw = np.exp(log_probs_raw)
         avg_probs = probs_raw.mean(axis=1)
-        log_probs = np.log(avg_probs + 1e-10)
-        mean_log_prob = log_probs.mean()
-        return mean_log_prob
+        log_probs_with_context = np.log(avg_probs + 1e-10)
+
+        # Compute no-context baseline
+        baseline_results = []
+        for val_example in validation_set:
+            prompts = [
+                create_prompt_template(val_example['prompt'],
+                                     val_example['all_generated_responses'][0],
+                                     val_example['all_generated_responses'][1],
+                                     None, None),
+                create_prompt_template(val_example['prompt'],
+                                     val_example['all_generated_responses'][1],
+                                     val_example['all_generated_responses'][0],
+                                     None, None)
+            ]
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
+            input_ids = inputs['input_ids'].to(model.device)
+            attention_mask = inputs['attention_mask'].to(model.device)
+
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits[:, -1, :]
+                logit_a = logits[:, token_a_id]
+                logit_b = logits[:, token_b_id]
+                logits_ab = torch.stack([logit_a, logit_b], dim=1)
+                log_probs_ab = F.log_softmax(logits_ab, dim=1)
+
+            prob_1 = np.exp(log_probs_ab[0, 0].item())
+            prob_2 = np.exp(log_probs_ab[1, 1].item())
+            baseline_results.append(np.log((prob_1 + prob_2) / 2.0 + 1e-10))
+
+        log_probs_no_context = np.array(baseline_results)
+
+        # Compute gain and SNR
+        gain = log_probs_with_context - log_probs_no_context
+        mean_gain = gain.mean()
+        std_gain = gain.std()
+        snr = mean_gain / (std_gain + 1e-10)
+
+        return snr
     else:
         return None
 
@@ -340,7 +377,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str,
                        default="./icl_optimized_results",
                        help="Directory to save results")
-    parser.add_argument("--batch_size", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size per device")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
@@ -512,7 +549,7 @@ def main():
             validation_set, args.batch_size, accelerator)
 
         if accelerator.is_main_process:
-            logger.info(f"Initial validation score: {initial_score:.4f}")
+            logger.info(f"Initial validation SNR: {initial_score:.4f}")
 
         current_indices = demo_indices.copy()
         current_labels = demo_labels.copy()
@@ -575,7 +612,7 @@ def main():
             if accelerator.is_main_process:
                 # Update if improvement found
                 if best_replacement_score > current_score:
-                    logger.info(f"    Found improvement! {current_score:.4f} -> {best_replacement_score:.4f}")
+                    logger.info(f"    Found improvement! SNR: {current_score:.4f} -> {best_replacement_score:.4f}")
                     logger.info(f"    Replaced index {current_indices[pos]} with {best_replacement_idx}")
                     current_indices[pos] = best_replacement_idx
                     current_labels[pos] = best_replacement_label
@@ -587,7 +624,7 @@ def main():
             logger.info(f"\nOptimization complete for context {ctx_num + 1}")
             logger.info(f"  Initial: indices={demo_indices}, labels={demo_labels}")
             logger.info(f"  Final:   indices={current_indices}, labels={current_labels}")
-            logger.info(f"  Score improvement: {initial_score:.4f} -> {current_score:.4f}")
+            logger.info(f"  SNR improvement: {initial_score:.4f} -> {current_score:.4f}")
 
             optimized_contexts.append((current_indices, current_labels))
 
