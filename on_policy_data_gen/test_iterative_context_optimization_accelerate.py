@@ -316,7 +316,7 @@ def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
 
         probs_raw = np.exp(log_probs_raw)
         avg_probs = probs_raw.mean(axis=1)
-        log_probs_with_context = np.log(avg_probs + 1e-10)
+        log_probs_with_context = np.log(avg_probs)
 
         # Compute no-context baseline
         baseline_results = []
@@ -345,7 +345,7 @@ def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
 
             prob_1 = np.exp(log_probs_ab[0, 0].item())
             prob_2 = np.exp(log_probs_ab[1, 1].item())
-            baseline_results.append(np.log((prob_1 + prob_2) / 2.0 + 1e-10))
+            baseline_results.append(np.log((prob_1 + prob_2) / 2.0))
 
         log_probs_no_context = np.array(baseline_results)
 
@@ -353,7 +353,7 @@ def evaluate_context_on_validation(model, tokenizer, token_a_id, token_b_id,
         gain = log_probs_with_context - log_probs_no_context
         mean_gain = gain.mean()
         std_gain = gain.std()
-        snr = mean_gain / (std_gain + 1e-10)
+        snr = mean_gain / std_gain
 
         return snr
     else:
@@ -628,7 +628,57 @@ def main():
 
         accelerator.wait_for_everyone()
 
-    # Test on full test set
+    # Test initial contexts on full test set
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing initial contexts on full test set")
+        logger.info(f"{'='*80}")
+
+    # Broadcast initial contexts
+    if accelerator.num_processes > 1:
+        if accelerator.is_main_process:
+            broadcast_data = {'initial_contexts': initial_contexts}
+        else:
+            broadcast_data = None
+
+        broadcast_list = [broadcast_data]
+        dist.broadcast_object_list(broadcast_list, src=0)
+        if not accelerator.is_main_process:
+            initial_contexts = broadcast_list[0]['initial_contexts']
+
+    initial_test_dataset = TestDataset(initial_contexts, candidate_examples, test_set)
+    initial_test_dataloader = DataLoader(initial_test_dataset, batch_size=args.batch_size,
+                                        shuffle=False, collate_fn=collate_fn, num_workers=0)
+    initial_test_dataloader = accelerator.prepare(initial_test_dataloader)
+
+    initial_test_results = []
+    for batch in tqdm(initial_test_dataloader, desc="Testing initial contexts", disable=not accelerator.is_main_process):
+        batch_results = compute_log_prob_batch(model, tokenizer, token_a_id, token_b_id, batch)
+        initial_test_results.extend(batch_results)
+
+    # Gather results
+    if accelerator.num_processes > 1:
+        gathered_results = [None] * accelerator.num_processes
+        torch.distributed.all_gather_object(gathered_results, initial_test_results)
+        if accelerator.is_main_process:
+            initial_test_results = []
+            for results_list in gathered_results:
+                initial_test_results.extend(results_list)
+
+    if accelerator.is_main_process:
+        # Process initial test results
+        log_probs_raw_initial = np.zeros((args.top_n, len(test_set), 2))
+        for result in initial_test_results:
+            ctx_idx = result['ctx_idx']
+            test_idx = result['test_idx']
+            ordering = result['ordering']
+            log_probs_raw_initial[ctx_idx, test_idx, ordering] = result['log_prob']
+
+        probs_raw_initial = np.exp(log_probs_raw_initial)
+        avg_probs_initial = probs_raw_initial.mean(axis=2)
+        log_probs_initial_context = np.log(avg_probs_initial)
+
+    # Test optimized contexts on full test set
     if accelerator.is_main_process:
         logger.info(f"\n{'='*80}")
         logger.info(f"Testing optimized contexts on full test set")
@@ -652,7 +702,7 @@ def main():
     test_dataloader = accelerator.prepare(test_dataloader)
 
     test_results = []
-    for batch in tqdm(test_dataloader, desc="Testing", disable=not accelerator.is_main_process):
+    for batch in tqdm(test_dataloader, desc="Testing optimized contexts", disable=not accelerator.is_main_process):
         batch_results = compute_log_prob_batch(model, tokenizer, token_a_id, token_b_id, batch)
         test_results.extend(batch_results)
 
@@ -666,7 +716,7 @@ def main():
                 test_results.extend(results_list)
 
     if accelerator.is_main_process:
-        # Process test results
+        # Process optimized test results
         log_probs_raw = np.zeros((args.top_n, len(test_set), 2))
         for result in test_results:
             ctx_idx = result['ctx_idx']
@@ -676,7 +726,7 @@ def main():
 
         probs_raw = np.exp(log_probs_raw)
         avg_probs = probs_raw.mean(axis=2)
-        log_probs_with_context = np.log(avg_probs + 1e-10)
+        log_probs_optimized_context = np.log(avg_probs)
 
         # Compute no-context baseline
         logger.info("Computing no-context baseline...")
@@ -706,28 +756,50 @@ def main():
 
             prob_1 = np.exp(log_probs_ab[0, 0].item())
             prob_2 = np.exp(log_probs_ab[1, 1].item())
-            baseline_results.append(np.log((prob_1 + prob_2) / 2.0 + 1e-10))
+            baseline_results.append(np.log((prob_1 + prob_2) / 2.0))
 
         log_probs_no_context = np.array(baseline_results)
-        gain = log_probs_with_context - log_probs_no_context[np.newaxis, :]
 
-        # Compute accuracy
-        accuracy_with_context = (avg_probs > 0.5).astype(float)
+        # Compute gain for initial contexts
+        gain_initial = log_probs_initial_context - log_probs_no_context[np.newaxis, :]
+
+        # Compute gain for optimized contexts
+        gain_optimized = log_probs_optimized_context - log_probs_no_context[np.newaxis, :]
+
+        # Compute accuracy for initial contexts
+        accuracy_initial_context = (avg_probs_initial > 0.5).astype(float)
+
+        # Compute accuracy for optimized contexts
+        accuracy_optimized_context = (avg_probs > 0.5).astype(float)
+
         probs_no_context = np.exp(log_probs_no_context)
         accuracy_no_context = (probs_no_context > 0.5).astype(float)
-        accuracy_gain = accuracy_with_context - accuracy_no_context[np.newaxis, :]
+
+        accuracy_gain_initial = accuracy_initial_context - accuracy_no_context[np.newaxis, :]
+        accuracy_gain_optimized = accuracy_optimized_context - accuracy_no_context[np.newaxis, :]
 
         logger.info(f"\n{'='*80}")
         logger.info(f"Test set results:")
         logger.info(f"{'='*80}")
-        for i, (indices, labels) in enumerate(optimized_contexts):
+        for i in range(len(optimized_contexts)):
+            initial_indices, initial_labels = initial_contexts[i]
+            optimized_indices, optimized_labels = optimized_contexts[i]
+
             logger.info(f"\nContext {i+1}:")
-            logger.info(f"  Indices: {indices}")
-            logger.info(f"  Labels: {labels}")
-            logger.info(f"  Mean log prob: {log_probs_with_context[i].mean():.4f}")
-            logger.info(f"  Mean gain: {gain[i].mean():.4f}")
-            logger.info(f"  Mean accuracy: {accuracy_with_context[i].mean():.4f}")
-            logger.info(f"  Mean acc gain: {accuracy_gain[i].mean():.4f}")
+            logger.info(f"  Initial indices: {initial_indices}, labels: {initial_labels}")
+            logger.info(f"    Mean log prob: {log_probs_initial_context[i].mean():.4f}")
+            logger.info(f"    Mean gain: {gain_initial[i].mean():.4f}")
+            logger.info(f"    Mean accuracy: {accuracy_initial_context[i].mean():.4f}")
+            logger.info(f"    Mean acc gain: {accuracy_gain_initial[i].mean():.4f}")
+            logger.info(f"  Optimized indices: {optimized_indices}, labels: {optimized_labels}")
+            logger.info(f"    Mean log prob: {log_probs_optimized_context[i].mean():.4f}")
+            logger.info(f"    Mean gain: {gain_optimized[i].mean():.4f}")
+            logger.info(f"    Mean accuracy: {accuracy_optimized_context[i].mean():.4f}")
+            logger.info(f"    Mean acc gain: {accuracy_gain_optimized[i].mean():.4f}")
+            logger.info(f"  Improvement (optimized - initial):")
+            logger.info(f"    Log prob: {(log_probs_optimized_context[i].mean() - log_probs_initial_context[i].mean()):.4f}")
+            logger.info(f"    Gain: {(gain_optimized[i].mean() - gain_initial[i].mean()):.4f}")
+            logger.info(f"    Accuracy: {(accuracy_optimized_context[i].mean() - accuracy_initial_context[i].mean()):.4f}")
 
         # Save results
         os.makedirs(args.output_dir, exist_ok=True)
@@ -737,12 +809,19 @@ def main():
                  optimized_contexts=optimized_contexts,
                  initial_contexts=initial_contexts,
                  test_subset_indices=test_subset_indices,
-                 log_probs_with_context=log_probs_with_context,
+                 # Initial context results
+                 log_probs_initial_context=log_probs_initial_context,
+                 gain_initial=gain_initial,
+                 accuracy_initial_context=accuracy_initial_context,
+                 accuracy_gain_initial=accuracy_gain_initial,
+                 # Optimized context results
+                 log_probs_optimized_context=log_probs_optimized_context,
+                 gain_optimized=gain_optimized,
+                 accuracy_optimized_context=accuracy_optimized_context,
+                 accuracy_gain_optimized=accuracy_gain_optimized,
+                 # No context baseline
                  log_probs_no_context=log_probs_no_context,
-                 gain=gain,
-                 accuracy_with_context=accuracy_with_context,
                  accuracy_no_context=accuracy_no_context,
-                 accuracy_gain=accuracy_gain,
                  k=k)
 
         logger.info(f"\nResults saved to: {output_file}")
