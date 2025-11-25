@@ -1,0 +1,56 @@
+{
+  "config": {
+    "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+    "k_shot": 4,
+    "test_size": 500,
+    "confidence_threshold": 0.8,
+    "seed": 42
+  },
+  "metrics": {
+    "accuracy": 0.868,
+    "accuracy_class_0": 0.9962825278810409,
+    "accuracy_class_1": 0.7186147186147186,
+    "num_samples": 500
+  },
+  "pseudo_labeling": {
+    "num_high_confidence": 389,
+    "pct_high_confidence": 77.8,
+    "high_conf_accuracy": 0.9485861182519281,
+    "num_pseudo_label_0": 280,
+    "num_pseudo_label_1": 109
+  },
+  "demonstrations": [
+    {
+      "text": "a very hung-over julie is also there , on a field trip with her art class .",
+      "label": 0
+    },
+    {
+      "text": "nick , a district attorney investigating the most recent case , a suspicious apparent suicide , and her interviews with friends and family of the deceased trigger extensive and intricately interwoven flashbacks that reveal surprising facts about the man 's life and death .",
+      "label": 0
+    },
+    {
+      "text": "impresses as a skillfully assembled , highly polished and professional adaptation . . . just about as chilling and unsettling as 'manhunter ' was .",
+      "label": 1
+    },
+    {
+      "text": "sebastien cortez is an up and coming film maker who has just gotten his big break in `` the biz . ``",
+      "label": 0
+    },
+    {
+      "text": "fine acting but there is no sense of connecting the dots , just dots .",
+      "label": 1
+    },
+    {
+      "text": "edgar , duncan 's sixty year old , distant father , does n't understand the strange manifestations of his son 's mourning .",
+      "label": 0
+    },
+    {
+      "text": "good , -- * interviews with dp neihouse and astronaut susan helms *",
+      "label": 1
+    },
+    {
+      "text": "this loud and thoroughly obnoxious comedy about a pair of squabbling working-class spouses is a deeply unpleasant experience .",
+      "label": 1
+    }
+  ]
+}
