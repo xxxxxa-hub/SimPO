@@ -113,19 +113,45 @@ def sample_demonstration_pool(train_data, pool_size, seed=42):
     return [train_data[int(i)] for i in indices]
 
 
-def generate_k_shot_permutations(pool_size, k_shot):
+def generate_k_shot_permutations(demo_pool, k_shot):
     """
-    Generate all k-shot permutations from a pool.
+    Generate all k-shot permutations from a pool with balanced labels.
+
+    For binary classification, ensures k//2 examples from each class.
 
     Args:
-        pool_size: Size of demonstration pool (e.g., 10)
-        k_shot: Number of demonstrations to use (e.g., 4)
+        demo_pool: Pool of demonstration examples with 'label' field
+        k_shot: Number of demonstrations to use (must be even for balance)
 
     Returns:
         List of tuples, each containing k indices
     """
-    # Generate all permutations of k indices from pool
-    return list(itertools.permutations(range(pool_size), k_shot))
+    if k_shot % 2 != 0:
+        raise ValueError(f"k_shot must be even for balanced labels, got {k_shot}")
+
+    # Split pool by label
+    label_0_indices = [i for i, ex in enumerate(demo_pool) if ex['label'] == 0]
+    label_1_indices = [i for i, ex in enumerate(demo_pool) if ex['label'] == 1]
+
+    k_per_class = k_shot // 2
+
+    # Generate all combinations of k//2 examples from each class
+    from itertools import combinations, permutations
+
+    combos_0 = list(combinations(label_0_indices, k_per_class))
+    combos_1 = list(combinations(label_1_indices, k_per_class))
+
+    # For each combination pair, generate all permutations
+    all_perms = []
+    for combo_0 in combos_0:
+        for combo_1 in combos_1:
+            # Combine the two groups
+            combined = list(combo_0) + list(combo_1)
+            # Generate all permutations of this balanced set
+            for perm in permutations(combined):
+                all_perms.append(perm)
+
+    return all_perms
 
 
 def evaluate_context_on_validation(model, tokenizer, demo_pool, demo_indices,
@@ -357,12 +383,14 @@ def main():
     print(f"Step 1: Generate all {args.k_shot}-shot permutations from {args.pool_size} demonstrations")
     print(f"{'='*80}")
 
-    all_permutations = generate_k_shot_permutations(args.pool_size, args.k_shot)
+    # CHANGE HERE: Pass 'demo_pool' instead of 'args.pool_size'
+    # The function needs to inspect the labels in the pool to ensure balance
+    all_permutations = generate_k_shot_permutations(demo_pool, args.k_shot)
+    
     print(f"Total permutations: {len(all_permutations)} (P({args.pool_size},{args.k_shot}))")
 
     # Compute no-context baseline on validation set
     print(f"\nComputing no-context baseline on validation set...")
-    breakpoint()
     log_probs_no_context = compute_no_context_baseline(model, tokenizer, validation_data, device)
 
     # Evaluate all permutations on validation set
@@ -455,10 +483,13 @@ def main():
 
         # Optimize each position
         for pos in range(args.k_shot):
-            print(f"\n  Optimizing position {pos}...")
+            # We enforce the existing label at this position to maintain class balance
+            target_label = current_labels[pos]
+            target_label_name = "objective" if target_label == 0 else "subjective"
+            
+            print(f"\n  Optimizing position {pos} (Fixed Label: {target_label_name})...")
 
             best_replacement_idx = current_indices[pos]
-            best_replacement_label = current_labels[pos]
             best_replacement_score = current_score
 
             # Try test examples as replacements
@@ -466,32 +497,33 @@ def main():
                                 desc=f"    Trying replacements at position {pos}",
                                 leave=False):
 
-                # For each test example, try BOTH possible labels (0 and 1)
-                for candidate_label in [0, 1]:
-                    candidate_indices = current_indices.copy()
-                    candidate_labels = current_labels.copy()
-                    candidate_indices[pos] = test_idx
-                    candidate_labels[pos] = candidate_label
+                # CHANGE: We do NOT iterate [0,1]. We assign the existing label to the test example.
+                candidate_indices = current_indices.copy()
+                
+                # We update the index to the test example
+                candidate_indices[pos] = test_idx
+                
+                # We do NOT change the label list. We use the label that was already 
+                # at this position (current_labels) to pseudo-label the test example.
+                
+                # Evaluate candidate
+                candidate_log_probs = evaluate_context_on_validation(
+                    model, tokenizer, candidate_examples, candidate_indices,
+                    validation_data, device, demo_labels=current_labels
+                )
+                candidate_score = compute_snr(candidate_log_probs, log_probs_no_context)
 
-                    # Evaluate candidate with this label
-                    candidate_log_probs = evaluate_context_on_validation(
-                        model, tokenizer, candidate_examples, candidate_indices,
-                        validation_data, device, demo_labels=candidate_labels
-                    )
-                    candidate_score = compute_snr(candidate_log_probs, log_probs_no_context)
-
-                    if candidate_score > best_replacement_score:
-                        best_replacement_idx = test_idx
-                        best_replacement_label = candidate_label
-                        best_replacement_score = candidate_score
+                if candidate_score > best_replacement_score:
+                    best_replacement_idx = test_idx
+                    best_replacement_score = candidate_score
 
             # Update if improvement found
             if best_replacement_score > current_score:
-                label_name = "objective" if best_replacement_label == 0 else "subjective"
                 print(f"    Found improvement! SNR: {current_score:.4f} -> {best_replacement_score:.4f}")
-                print(f"    Replaced index {current_indices[pos]} with {best_replacement_idx} (label={label_name})")
+                print(f"    Replaced index {current_indices[pos]} with {best_replacement_idx} (Pseudo-label: {target_label_name})")
+                
                 current_indices[pos] = best_replacement_idx
-                current_labels[pos] = best_replacement_label
+                # current_labels[pos] remains unchanged because we forced the test example to take that label
                 current_score = best_replacement_score
             else:
                 print(f"    No improvement found, keeping position {pos} unchanged")
