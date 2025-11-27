@@ -191,13 +191,13 @@ class OpenAIInferenceClient(InferenceClient):
 
         self.client = OpenAI(api_key=self.api_key)
 
-    def generate_text(self, prompt: str, max_new_tokens: int = 200) -> str:
+    def generate_text(self, prompt: str) -> str:
         """Generate text using OpenAI API."""
         try:
             response = self.client.completions.create(
                 model=self.model_name,
                 prompt=prompt,
-                max_tokens=max_new_tokens,
+                max_tokens=4096,
                 temperature=0.7,
                 top_p=1.0,
                 echo=False
