@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 def infer_persona_description(
     client,
     demo_examples: List[Dict],
-    demo_flips: List[bool],
+    yw_first_flags: List[bool],
     reasoning_analyses: Optional[List[str]] = None
 ) -> str:
     """
@@ -27,7 +27,7 @@ def infer_persona_description(
     Args:
         client: Inference client to generate persona description
         demo_examples: List of demonstration examples
-        demo_flips: List of flip flags indicating preferred responses
+        yw_first_flags: List of flags indicating if ctx_yw should appear first for each demonstration
         reasoning_analyses: Optional pre-generated reasoning about differences
 
     Returns:
@@ -38,8 +38,8 @@ def infer_persona_description(
     # Build context from demonstrations
     demo_context = "## User's Demonstration Examples\n\n"
 
-    for i, (demo_example, demo_flip, reasoning) in enumerate(
-        zip(demo_examples, demo_flips, reasoning_analyses or [None] * len(demo_examples))
+    for i, (demo_example, yw_first, reasoning) in enumerate(
+        zip(demo_examples, yw_first_flags, reasoning_analyses or [None] * len(demo_examples))
     ):
         ctx_question = demo_example['prompt']
         ctx_yw = demo_example['all_generated_responses'][0]
@@ -48,17 +48,17 @@ def infer_persona_description(
         demo_context += f"### Example {i + 1}\n"
         demo_context += f"**Question**: {ctx_question}\n\n"
 
-        if demo_flip:
-            demo_context += f"**Preferred Response**: Response B\n"
-            demo_context += f"Response A:\n{ctx_yl[:200]}...\n\n"
-            demo_context += f"Response B:\n{ctx_yw[:200]}...\n\n"
+        if yw_first:
+            demo_context += f"Response A:\n{ctx_yw}\n\n"
+            demo_context += f"Response B:\n{ctx_yl}\n\n"
+            demo_context += f"**Preferred Response**: Response A\n\n"
         else:
-            demo_context += f"**Preferred Response**: Response A\n"
-            demo_context += f"Response A:\n{ctx_yw[:200]}...\n\n"
-            demo_context += f"Response B:\n{ctx_yl[:200]}...\n\n"
+            demo_context += f"Response A:\n{ctx_yl}\n\n"
+            demo_context += f"Response B:\n{ctx_yw}\n\n"
+            demo_context += f"**Preferred Response**: Response B\n\n"
 
         if reasoning:
-            demo_context += f"**Key Differences**: {reasoning[:300]}...\n\n"
+            demo_context += f"**Key Differences**: {reasoning}\n\n"
 
     # Create prompt to infer persona
     persona_prompt = f"""Based on the examples below where a user consistently chooses certain types of responses, infer what kind of persona or preferences this user has. Focus on:

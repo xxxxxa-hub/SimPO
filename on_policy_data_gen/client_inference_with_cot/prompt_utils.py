@@ -14,7 +14,7 @@ def create_prompt_template(
     response_a: str,
     response_b: str,
     demo_examples: Optional[List[Dict]] = None,
-    demo_flips: Optional[List[bool]] = None,
+    yw_first_flags: Optional[List[bool]] = None,
     demo_reasonings: Optional[List[str]] = None
 ) -> str:
     """
@@ -30,7 +30,7 @@ def create_prompt_template(
         response_a: Response A for test question
         response_b: Response B for test question
         demo_examples: List of demonstration examples
-        demo_flips: List of flip flags for demonstrations
+        yw_first_flags: List of flags indicating if ctx_yw should appear first for demonstrations
         demo_reasonings: List of pre-generated reasoning texts for demonstrations
 
     Returns:
@@ -39,9 +39,9 @@ def create_prompt_template(
     prompt_text = ""
 
     # Add demonstrations with pre-generated reasonings
-    if demo_examples is not None and demo_flips is not None and demo_reasonings is not None:
-        for i, (demo_example, demo_flip, reasoning) in enumerate(
-            zip(demo_examples, demo_flips, demo_reasonings)
+    if demo_examples is not None and yw_first_flags is not None and demo_reasonings is not None:
+        for i, (demo_example, yw_first, reasoning) in enumerate(
+            zip(demo_examples, yw_first_flags, demo_reasonings)
         ):
             ctx_question = demo_example['prompt']
             ctx_yw = demo_example['all_generated_responses'][0]
@@ -50,20 +50,18 @@ def create_prompt_template(
             prompt_text += f"# Example {i+1}\n"
             prompt_text += f"## Question\n{ctx_question}\n\n"
 
-            if demo_flip:
-                prompt_text += f"[The Start of Assistant A's Answer]\n{ctx_yl}\n"
-                prompt_text += f"[The End of Assistant A's Answer]\n\n"
-                prompt_text += f"[The Start of Assistant B's Answer]\n{ctx_yw}\n"
-                prompt_text += f"[The End of Assistant B's Answer]\n\n"
-                prompt_text += f"## Analysis\n{reasoning}\n"
-                prompt_text += "## Preferred answer: [[B]]\n\n"
-            else:
+            if yw_first:
                 prompt_text += f"[The Start of Assistant A's Answer]\n{ctx_yw}\n"
                 prompt_text += f"[The End of Assistant A's Answer]\n\n"
                 prompt_text += f"[The Start of Assistant B's Answer]\n{ctx_yl}\n"
                 prompt_text += f"[The End of Assistant B's Answer]\n\n"
-                prompt_text += f"## Analysis\n{reasoning}\n"
-                prompt_text += "## Preferred answer: [[A]]\n\n"
+            else:
+                prompt_text += f"[The Start of Assistant A's Answer]\n{ctx_yl}\n"
+                prompt_text += f"[The End of Assistant A's Answer]\n\n"
+                prompt_text += f"[The Start of Assistant B's Answer]\n{ctx_yw}\n"
+                prompt_text += f"[The End of Assistant B's Answer]\n\n"
+
+            prompt_text += f"## Analysis\n{reasoning}\n\n"
 
     # Add task header
     prompt_text += "# Task\n"
