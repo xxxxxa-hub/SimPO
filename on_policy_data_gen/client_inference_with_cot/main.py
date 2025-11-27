@@ -68,6 +68,34 @@ def load_demo_reasonings_from_file(reasoning_file: str) -> List[str]:
         return None
 
 
+def load_persona_description_from_file(persona_file: str) -> str:
+    """
+    Load persona description from a persona output file.
+
+    Args:
+        persona_file: Path to the persona output file (JSON format)
+
+    Returns:
+        Persona description string, or None if file doesn't exist
+    """
+    if not persona_file or not os.path.exists(persona_file):
+        return None
+
+    try:
+        with open(persona_file, 'r') as f:
+            data = json.load(f)
+            persona_description = data.get('persona_description')
+            if persona_description:
+                logger.info(f"Loaded persona description from: {persona_file}")
+                return persona_description
+            else:
+                logger.warning(f"No persona_description field found in {persona_file}")
+                return None
+    except Exception as e:
+        logger.warning(f"Failed to load persona description from {persona_file}: {e}")
+        return None
+
+
 def evaluate_kshot_prompt(
     client,
     test_example: Dict,
@@ -234,9 +262,6 @@ def parse_args():
     parser.add_argument("--seed", type=int,
                        default=42,
                        help="Random seed")
-    parser.add_argument("--num_samples", type=int,
-                       default=5,
-                       help="Number of random k-shot samples to evaluate per test example")
     parser.add_argument("--num_workers", type=int,
                        default=1,
                        help="Number of parallel workers for multiprocessing (1 = no parallelism)")
@@ -255,7 +280,7 @@ def main():
     logger.info(f"Inference backend: {args.inference_backend}")
     logger.info(f"Model: {args.model_name}")
     logger.info(f"k-shot: {args.k}")
-    logger.info(f"Number of samples per test example: {args.num_samples}")
+    logger.info(f"Random seed: {args.seed}")
 
     # Load npz file to get candidate demonstration indices
     logger.info(f"\nLoading candidate demonstrations from: {args.npz_file}")
@@ -317,7 +342,6 @@ def main():
         # Create inference client
         logger.info(f"\nInitializing inference client...")
         client = create_inference_client(args)
-        breakpoint()
         # Preprocess sampled demonstrations: generate reasoning for each one
         logger.info(f"\nPreprocessing demonstrations (generating reasoning for {len(sampled_demos)} examples)...")
         demo_reasonings = preprocess_demonstrations(
@@ -330,83 +354,87 @@ def main():
         # Create inference client for persona inference and evaluation
         logger.info(f"\nInitializing inference client...")
         client = create_inference_client(args)
-        breakpoint()
 
     # Infer persona description
     if args.persona_output_file:
-        logger.info(f"\nInferring persona description from demonstration patterns...")
-        persona_description = infer_persona_description(
-            client, sampled_demos, sampled_yw_first, demo_reasonings
-        )
-        with open(args.persona_output_file, 'w') as f:
-            json.dump({'persona_description': persona_description}, f, indent=2)
-        logger.info(f"Persona description saved to: {args.persona_output_file}")
+        # Try to load persona description from file if available
+        persona_description = load_persona_description_from_file(args.persona_output_file)
+
+        # If not loaded from file, generate via API
+        if persona_description is None:
+            logger.info(f"\nInferring persona description from demonstration patterns...")
+            persona_description = infer_persona_description(
+                client, sampled_demos, sampled_yw_first, demo_reasonings
+            )
+            # Save to file for future use
+            with open(args.persona_output_file, 'w') as f:
+                json.dump({'persona_description': persona_description}, f, indent=2)
+            logger.info(f"Persona description saved to: {args.persona_output_file}")
+        else:
+            logger.info(f"Using cached persona description from file, skipping inference")
 
     # Evaluate on test set
     logger.info(f"\nEvaluating on test set ({len(test_set)} examples)...")
+    logger.info(f"Using sampled demo pool indices: {sampled_indices}")
 
     # Store results
-    all_log_probs = np.zeros((args.num_samples, len(test_set), 2))
-    all_probs = np.zeros((args.num_samples, len(test_set), 2))
+    all_log_probs = np.zeros((len(test_set), 2))
+    all_probs = np.zeros((len(test_set), 2))
 
-    # Store the sampled demo indices and yw_first flags used for all iterations
-    all_demo_indices = [sampled_indices]
-    all_yw_first_flags = [sampled_yw_first]
+    # Store the sampled demo indices and yw_first flags used
+    all_demo_indices = np.array(sampled_indices)
+    all_yw_first_flags = np.array(sampled_yw_first)
 
-    # Use the cached demo reasonings for all evaluations
+    # Use the cached demo reasonings for evaluation
     sampled_demo_reasonings = demo_reasonings
 
-    for sample_idx in range(args.num_samples):
-        logger.info(f"\nSample {sample_idx + 1}/{args.num_samples}")
-        logger.info(f"Using sampled demo pool indices: {sampled_indices}")
+    # Evaluate each test example
+    if args.num_workers > 1:
+        logger.info(f"Using {args.num_workers} workers for parallel processing")
 
-        # Evaluate each test example
-        if args.num_workers > 1:
-            logger.info(f"Using {args.num_workers} workers for parallel processing")
+        client_args = {
+            'inference_backend': args.inference_backend,
+            'model_name': args.model_name,
+            'vllm_url': args.vllm_url if hasattr(args, 'vllm_url') else None,
+            'api_key': args.api_key if hasattr(args, 'api_key') else None
+        }
 
-            client_args = {
-                'inference_backend': args.inference_backend,
-                'model_name': args.model_name,
-                'vllm_url': args.vllm_url if hasattr(args, 'vllm_url') else None,
-                'api_key': args.api_key if hasattr(args, 'api_key') else None
-            }
+        worker_args = [
+            (test_idx, test_example, client_args, sampled_demos, sampled_yw_first, sampled_demo_reasonings)
+            for test_idx, test_example in enumerate(test_set)
+        ]
 
-            worker_args = [
-                (test_idx, test_example, client_args, sampled_demos, sampled_yw_first, sampled_demo_reasonings)
-                for test_idx, test_example in enumerate(test_set)
-            ]
+        with Pool(processes=args.num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(evaluate_test_example_worker, worker_args),
+                total=len(test_set),
+                desc="Evaluating test examples"
+            ))
 
-            with Pool(processes=args.num_workers) as pool:
-                results = list(tqdm(
-                    pool.imap(evaluate_test_example_worker, worker_args),
-                    total=len(test_set),
-                    desc=f"Sample {sample_idx + 1}"
-                ))
-
-            for test_idx, log_probs, probs in results:
-                all_log_probs[sample_idx, test_idx, 0] = log_probs[0]
-                all_log_probs[sample_idx, test_idx, 1] = log_probs[1]
-                all_probs[sample_idx, test_idx, 0] = probs[0]
-                all_probs[sample_idx, test_idx, 1] = probs[1]
-        else:
-            # Sequential processing
-            for test_idx, test_example in enumerate(tqdm(test_set, desc=f"Sample {sample_idx + 1}")):
-                for ordering in [0, 1]:
-                    log_prob, prob = evaluate_kshot_prompt(
-                        client, test_example, sampled_demos, sampled_yw_first, sampled_demo_reasonings, ordering
-                    )
-                    all_log_probs[sample_idx, test_idx, ordering] = log_prob
-                    all_probs[sample_idx, test_idx, ordering] = prob
+        for test_idx, log_probs, probs in results:
+            all_log_probs[test_idx, 0] = log_probs[0]
+            all_log_probs[test_idx, 1] = log_probs[1]
+            all_probs[test_idx, 0] = probs[0]
+            all_probs[test_idx, 1] = probs[1]
+    else:
+        # Sequential processing
+        for test_idx, test_example in enumerate(tqdm(test_set, desc="Evaluating test examples")):
+            for ordering in [0, 1]:
+                log_prob, prob = evaluate_kshot_prompt(
+                    client, test_example, sampled_demos, sampled_yw_first, sampled_demo_reasonings, ordering
+                )
+                all_log_probs[test_idx, ordering] = log_prob
+                all_probs[test_idx, ordering] = prob
 
     # Compute statistics
     logger.info("\nComputing statistics...")
 
-    avg_probs_per_sample = all_probs.mean(axis=2)
-    avg_probs = avg_probs_per_sample.mean(axis=0)
-    std_probs = avg_probs_per_sample.std(axis=0)
+    # Average probability over the two orderings for each test example
+    avg_probs = all_probs.mean(axis=1)
+    std_probs = all_probs.std(axis=1)
 
-    accuracy_per_sample = (avg_probs_per_sample > 0.5).astype(float)
-    avg_accuracy = accuracy_per_sample.mean(axis=0)
+    # Compute accuracy for each test example
+    avg_accuracy = (avg_probs > 0.5).astype(float)
 
     mean_prob = avg_probs.mean()
     mean_accuracy = avg_accuracy.mean()
@@ -436,7 +464,7 @@ def main():
         num_candidate_demos=len(candidate_demonstrations),
         num_validation_demos=len(validation_set),
         k=args.k,
-        num_samples=args.num_samples,
+        seed=args.seed,
         persona_id=actual_persona_id,
         model_name=args.model_name,
         inference_backend=args.inference_backend
