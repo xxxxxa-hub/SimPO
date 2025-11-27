@@ -142,7 +142,7 @@ def evaluate_kshot_prompt(
 
     # Generate reasoning for the test example, then get the final verdict
     reasoning = client.generate_text(prompt)
-    final_prompt = prompt + reasoning + "\n## Preferred answer: [["
+    final_prompt = prompt + reasoning + "\n\n## Preferred Response\n[["
 
     # Get token probabilities for final verdict
     token_logprobs = client.get_token_probabilities(final_prompt, ["A", "B"])
@@ -334,6 +334,7 @@ def main():
 
     # Try to load demo reasonings from reasoning_output_file if available
     demo_reasonings = None
+    breakpoint()
     if args.reasoning_output_file:
         demo_reasonings = load_demo_reasonings_from_file(args.reasoning_output_file)
 
@@ -364,12 +365,9 @@ def main():
         if persona_description is None:
             logger.info(f"\nInferring persona description from demonstration patterns...")
             persona_description = infer_persona_description(
-                client, sampled_demos, sampled_yw_first, demo_reasonings
+                client, sampled_demos, sampled_yw_first, demo_reasonings,
+                output_file=args.persona_output_file
             )
-            # Save to file for future use
-            with open(args.persona_output_file, 'w') as f:
-                json.dump({'persona_description': persona_description}, f, indent=2)
-            logger.info(f"Persona description saved to: {args.persona_output_file}")
         else:
             logger.info(f"Using cached persona description from file, skipping inference")
 

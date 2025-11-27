@@ -51,17 +51,18 @@ def create_prompt_template(
             prompt_text += f"## Question\n{ctx_question}\n\n"
 
             if yw_first:
-                prompt_text += f"[The Start of Assistant A's Answer]\n{ctx_yw}\n"
-                prompt_text += f"[The End of Assistant A's Answer]\n\n"
-                prompt_text += f"[The Start of Assistant B's Answer]\n{ctx_yl}\n"
-                prompt_text += f"[The End of Assistant B's Answer]\n\n"
+                prompt_text += f"## Response A\n{ctx_yw}\n\n"
+                prompt_text += f"## Response B\n{ctx_yl}\n\n"
             else:
-                prompt_text += f"[The Start of Assistant A's Answer]\n{ctx_yl}\n"
-                prompt_text += f"[The End of Assistant A's Answer]\n\n"
-                prompt_text += f"[The Start of Assistant B's Answer]\n{ctx_yw}\n"
-                prompt_text += f"[The End of Assistant B's Answer]\n\n"
+                prompt_text += f"## Response A\n{ctx_yl}\n\n"
+                prompt_text += f"## Response B\n{ctx_yw}\n\n"
 
             prompt_text += f"## Analysis\n{reasoning}\n\n"
+
+            if yw_first:
+                prompt_text += f"## Preferred Response\n[[A]]\n\n"
+            else:
+                prompt_text += f"## Preferred Response\n[[B]]\n\n"
 
     # Add task header
     prompt_text += "# Task\n"
@@ -72,10 +73,8 @@ def create_prompt_template(
 
     # Add the current query
     prompt_text += f"## Question\n{question}\n\n"
-    prompt_text += f"[The Start of Assistant A's Answer]\n{response_a}\n"
-    prompt_text += f"[The End of Assistant A's Answer]\n\n"
-    prompt_text += f"[The Start of Assistant B's Answer]\n{response_b}\n"
-    prompt_text += f"[The End of Assistant B's Answer]\n\n"
+    prompt_text += f"## Response A\n{response_a}\n\n"
+    prompt_text += f"## Response B\n{response_b}\n\n"
 
     prompt_text += "## Analysis\nLet me analyze these responses step by step:\n"
 

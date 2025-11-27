@@ -42,29 +42,13 @@ def generate_demo_reasoning(client, demo_example: Dict, yw_first: bool) -> str:
 ## Question
 {ctx_question}
 
-"""
+## Response A
+{ctx_yw if yw_first else ctx_yl}
 
-    if yw_first:
-        reasoning_prompt += f"""[Response A]
-{ctx_yw}
-[End of Response A]
+## Response B
+{ctx_yl if yw_first else ctx_yw}
 
-[Response B]
-{ctx_yl}
-[End of Response B]
-
-## Differences Analysis
-"""
-    else:
-        reasoning_prompt += f"""[Response A]
-{ctx_yl}
-[End of Response A]
-
-[Response B]
-{ctx_yw}
-[End of Response B]
-
-## Differences Analysis
+## Analysis
 """
 
     # Generate reasoning
