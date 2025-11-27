@@ -68,7 +68,7 @@ def generate_demo_reasoning(client, demo_example: Dict, yw_first: bool) -> str:
 """
 
     # Generate reasoning
-    reasoning = client.generate_text(reasoning_prompt, max_new_tokens=300)
+    reasoning = client.generate_text(reasoning_prompt)
     return reasoning
 
 
