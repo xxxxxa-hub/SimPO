@@ -20,14 +20,16 @@ import json
 from tqdm import tqdm
 from datasets import load_dataset
 from multiprocessing import Pool
-from functools import partial
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # Import from sibling modules
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
-from demo_reasoning_utils import preprocess_demonstrations
+from reasoning_utils import (
+    generate_reasonings,
+    load_reasonings_from_file
+)
 from persona_inference import infer_persona_description, create_persona_context
 from inference_clients import create_inference_client
 from prompt_utils import create_prompt_template
@@ -41,31 +43,6 @@ from demo_selection_utils import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def load_demo_reasonings_from_file(reasoning_file: str) -> List[str]:
-    """
-    Load demo reasonings from a reasoning output file.
-
-    Args:
-        reasoning_file: Path to the reasoning output file (JSON format from preprocess_demonstrations)
-
-    Returns:
-        List of reasoning strings, or None if file doesn't exist
-    """
-    if not reasoning_file or not os.path.exists(reasoning_file):
-        return None
-
-    try:
-        with open(reasoning_file, 'r') as f:
-            data = json.load(f)
-            # Extract reasoning strings from the demonstrations
-            reasonings = [demo['differences_analysis'] for demo in data.get('demonstrations', [])]
-            logger.info(f"Loaded {len(reasonings)} demo reasonings from: {reasoning_file}")
-            return reasonings
-    except Exception as e:
-        logger.warning(f"Failed to load demo reasonings from {reasoning_file}: {e}")
-        return None
 
 
 def load_persona_description_from_file(persona_file: str) -> str:
@@ -102,7 +79,10 @@ def evaluate_kshot_prompt(
     demo_examples: List[Dict],
     yw_first_flags: List[bool],
     demo_reasonings: List[str],
-    ordering: int
+    ordering: int,
+    test_reasoning: Optional[str] = None,
+    persona_description: Optional[str] = None,
+    use_reasoning: bool = False
 ) -> Tuple[float, float]:
     """
     Evaluate a single test example with k-shot demonstrations using pre-generated reasonings.
@@ -114,6 +94,9 @@ def evaluate_kshot_prompt(
         yw_first_flags: List of k boolean flags (True if ctx_yw should appear first)
         demo_reasonings: List of pre-generated reasoning texts for demonstrations
         ordering: 0 or 1, which ordering to use for test example
+        test_reasoning: Optional pre-generated reasoning for the test example at this ordering
+        persona_description: Optional inferred description of user preferences
+        use_reasoning: Whether to include reasoning analysis and persona description (default: False for baseline)
 
     Returns:
         Tuple of (log_prob_correct, probability_correct)
@@ -128,7 +111,10 @@ def evaluate_kshot_prompt(
             test_prompt, test_yw, test_yl,
             demo_examples=demo_examples,
             yw_first_flags=yw_first_flags,
-            demo_reasonings=demo_reasonings
+            demo_reasonings=demo_reasonings,
+            test_reasoning=test_reasoning,
+            persona_description=persona_description if use_reasoning else None,
+            use_reasoning=use_reasoning
         )
         correct_token = "A"
     else:
@@ -136,13 +122,13 @@ def evaluate_kshot_prompt(
             test_prompt, test_yl, test_yw,
             demo_examples=demo_examples,
             yw_first_flags=yw_first_flags,
-            demo_reasonings=demo_reasonings
+            demo_reasonings=demo_reasonings,
+            test_reasoning=test_reasoning,
+            persona_description=persona_description if use_reasoning else None,
+            use_reasoning=use_reasoning
         )
         correct_token = "B"
-
-    # Generate reasoning for the test example, then get the final verdict
-    reasoning = client.generate_text(prompt)
-    final_prompt = prompt + reasoning + "\n\n## Preferred Response\n[["
+    final_prompt = prompt
 
     # Get token probabilities for final verdict
     token_logprobs = client.get_token_probabilities(final_prompt, ["A", "B"])
@@ -176,7 +162,7 @@ def evaluate_test_example_worker(args_tuple):
 
     Each worker creates its own inference client to avoid pickling issues.
     """
-    test_idx, test_example, client_args, sampled_demos, sampled_yw_first, sampled_demo_reasonings = args_tuple
+    test_idx, test_example, client_args, sampled_demos, sampled_yw_first, sampled_demo_reasonings, test_reasonings, persona_description, use_reasoning = args_tuple
 
     # Create client in this worker process
     if client_args['inference_backend'] == "vllm":
@@ -206,8 +192,12 @@ def evaluate_test_example_worker(args_tuple):
 
     # Evaluate both orderings
     for ordering in [0, 1]:
+        test_reasoning = test_reasonings[test_idx][ordering] if test_reasonings else None
         log_prob, prob = evaluate_kshot_prompt(
-            client, test_example, sampled_demos, sampled_yw_first, sampled_demo_reasonings, ordering
+            client, test_example, sampled_demos, sampled_yw_first, sampled_demo_reasonings, ordering,
+            test_reasoning=test_reasoning,
+            persona_description=persona_description,
+            use_reasoning=use_reasoning
         )
         log_probs.append(log_prob)
         probs.append(prob)
@@ -253,18 +243,23 @@ def parse_args():
     parser.add_argument("--output_dir", type=str,
                        default="./kshot_inference_results",
                        help="Directory to save results")
-    parser.add_argument("--reasoning_output_file", type=str,
+    parser.add_argument("--demo_reasoning_output_file", type=str,
                        default=None,
-                       help="Optional file to save generated reasoning analysis (JSON)")
+                       help="Optional file to save generated demonstration reasoning analysis (JSON)")
     parser.add_argument("--persona_output_file", type=str,
                        default=None,
                        help="Optional file to save inferred persona description")
+    parser.add_argument("--test_reasoning_output_file", type=str,
+                       default=None,
+                       help="Optional file to save test example reasoning analysis (JSON)")
     parser.add_argument("--seed", type=int,
                        default=42,
                        help="Random seed")
     parser.add_argument("--num_workers", type=int,
                        default=1,
                        help="Number of parallel workers for multiprocessing (1 = no parallelism)")
+    parser.add_argument("--use_reasoning", action="store_true",
+                       help="Enable reasoning analysis and persona description in prompts (default: False for baseline)")
 
     return parser.parse_args()
 
@@ -280,6 +275,7 @@ def main():
     logger.info(f"Inference backend: {args.inference_backend}")
     logger.info(f"Model: {args.model_name}")
     logger.info(f"k-shot: {args.k}")
+    logger.info(f"Prompt mode: {'Reasoning (with analysis & persona)' if args.use_reasoning else 'Baseline (simple evaluation)'}")
     logger.info(f"Random seed: {args.seed}")
 
     # Load npz file to get candidate demonstration indices
@@ -332,11 +328,12 @@ def main():
     logger.info(f"Sampled demonstration indices: {sampled_indices}")
     logger.info(f"yw_first flags: {sampled_yw_first}")
 
-    # Try to load demo reasonings from reasoning_output_file if available
+    # Try to load demo reasonings from demo_reasoning_output_file if available
     demo_reasonings = None
-    breakpoint()
-    if args.reasoning_output_file:
-        demo_reasonings = load_demo_reasonings_from_file(args.reasoning_output_file)
+    if args.demo_reasoning_output_file:
+        all_reasonings = load_reasonings_from_file(args.demo_reasoning_output_file)
+        # Convert from List[List[str]] to List[str] by taking the first reasoning
+        demo_reasonings = [reasonings[0] for reasonings in all_reasonings] if all_reasonings else None
 
     # If not loaded from file, generate via API
     if demo_reasonings is None:
@@ -345,10 +342,18 @@ def main():
         client = create_inference_client(args)
         # Preprocess sampled demonstrations: generate reasoning for each one
         logger.info(f"\nPreprocessing demonstrations (generating reasoning for {len(sampled_demos)} examples)...")
-        demo_reasonings = preprocess_demonstrations(
-            client, sampled_demos, sampled_yw_first,
-            output_file=args.reasoning_output_file
+        all_demo_reasonings = generate_reasonings(
+            client, sampled_demos,
+            output_file=args.demo_reasoning_output_file,
+            num_workers=args.num_workers,
+            inference_backend=args.inference_backend,
+            model_name=args.model_name,
+            vllm_url=args.vllm_url if hasattr(args, 'vllm_url') else None,
+            api_key=args.api_key if hasattr(args, 'api_key') else None,
+            yw_first_flags=sampled_yw_first
         )
+        # Extract just the reasoning string from each result (demos have one reasoning per example)
+        demo_reasonings = [reasonings[0] for reasonings in all_demo_reasonings]
         logger.info(f"Successfully generated reasonings for all demonstrations")
     else:
         logger.info(f"Using cached demo reasonings from file, skipping API calls")
@@ -370,6 +375,27 @@ def main():
             )
         else:
             logger.info(f"Using cached persona description from file, skipping inference")
+
+    # Generate test reasonings
+    test_reasonings = None
+    if args.test_reasoning_output_file:
+        test_reasonings = load_reasonings_from_file(args.test_reasoning_output_file)
+
+    # If not loaded from file, generate via API
+    if test_reasonings is None:
+        logger.info(f"\nGenerating reasonings for test examples...")
+        test_reasonings = generate_reasonings(
+            client, test_set,
+            output_file=args.test_reasoning_output_file,
+            num_workers=args.num_workers,
+            inference_backend=args.inference_backend,
+            model_name=args.model_name,
+            vllm_url=args.vllm_url if hasattr(args, 'vllm_url') else None,
+            api_key=args.api_key if hasattr(args, 'api_key') else None
+        )
+        logger.info(f"Successfully generated reasonings for all test examples")
+    else:
+        logger.info(f"Using cached test reasonings from file, skipping generation")
 
     # Evaluate on test set
     logger.info(f"\nEvaluating on test set ({len(test_set)} examples)...")
@@ -398,7 +424,7 @@ def main():
         }
 
         worker_args = [
-            (test_idx, test_example, client_args, sampled_demos, sampled_yw_first, sampled_demo_reasonings)
+            (test_idx, test_example, client_args, sampled_demos, sampled_yw_first, sampled_demo_reasonings, test_reasonings, persona_description, args.use_reasoning)
             for test_idx, test_example in enumerate(test_set)
         ]
 
@@ -418,8 +444,12 @@ def main():
         # Sequential processing
         for test_idx, test_example in enumerate(tqdm(test_set, desc="Evaluating test examples")):
             for ordering in [0, 1]:
+                test_reasoning = test_reasonings[test_idx][ordering] if test_reasonings else None
                 log_prob, prob = evaluate_kshot_prompt(
-                    client, test_example, sampled_demos, sampled_yw_first, sampled_demo_reasonings, ordering
+                    client, test_example, sampled_demos, sampled_yw_first, sampled_demo_reasonings, ordering,
+                    test_reasoning=test_reasoning,
+                    persona_description=persona_description,
+                    use_reasoning=args.use_reasoning
                 )
                 all_log_probs[test_idx, ordering] = log_prob
                 all_probs[test_idx, ordering] = prob
